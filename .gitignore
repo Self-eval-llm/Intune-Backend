@@ -1,0 +1,81 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# Environment Variables
+.env
+.env.local
+
+# Models (large files)
+models/
+*.gguf
+*.safetensors
+*.bin
+*.pth
+*.pt
+
+# Checkpoints
+checkpoints/
+
+# Cache
+.cache/
+unsloth_compiled_cache/
+
+# Reports
+reports/*.json
+reports/*.html
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Data files (optional - comment out if you want to track them)
+data/raw/*.json
+data/processed/*.jsonl
+
+# llama.cpp (large repo)
+llama.cpp/
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Test outputs
+test_outputs/
+output*.json
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
