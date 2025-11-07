@@ -27,21 +27,6 @@ finetune_worker_thread = None
 last_finetune_check = None
 
 
-def get_worker_status() -> dict:
-    """
-    Get current worker status and state.
-    
-    Returns:
-        dict: Current worker status information
-    """
-    global finetune_worker_running, last_finetune_check
-    
-    return {
-        "running": finetune_worker_running,
-        "last_check": last_finetune_check,
-        "thread_active": finetune_worker_thread is not None and finetune_worker_thread.is_alive()
-    }
-
 
 def check_finetune_conditions() -> Tuple[bool, int, int]:
     """
@@ -268,39 +253,6 @@ def stop_finetune_worker() -> dict:
             "message": f"Error stopping finetune worker: {str(e)}",
             "worker_running": False
         }
-
-
-def run_finetune_now() -> dict:
-    """
-    Run fine-tuning immediately without waiting for conditions.
-    
-    Returns:
-        dict: Result of the finetune execution
-    """
-    try:
-        logger.info("Manual finetune execution requested...")
-        
-        # Run finetune script
-        success = run_finetune_script()
-        
-        if success:
-            return {
-                "success": True,
-                "message": "Fine-tuning completed successfully"
-            }
-        else:
-            return {
-                "success": False,
-                "message": "Fine-tuning failed. Check logs for details."
-            }
-            
-    except Exception as e:
-        logger.error(f"Error in manual finetune execution: {e}")
-        return {
-            "success": False,
-            "message": f"Error running finetune: {str(e)}"
-        }
-
 
 def get_finetune_status() -> dict:
     """

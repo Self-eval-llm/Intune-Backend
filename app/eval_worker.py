@@ -533,24 +533,3 @@ def get_pending_evaluations() -> dict:
             "error": str(e)
         }
 
-
-def check_evaluation_health() -> dict:
-    """Check health of evaluation system"""
-    try:
-        # Test Supabase connection
-        supabase = get_supabase_client()
-        response = supabase.table("intune_db").select("id").limit(1).execute()
-        supabase_healthy = True
-    except Exception as e:
-        logger.error(f"Supabase health check failed: {e}")
-        supabase_healthy = False
-    
-    return {
-        "status": "healthy" if supabase_healthy else "degraded",
-        "supabase_connection": supabase_healthy,
-        "workers": {
-            "first_eval": workers_running["first_eval"],
-            "final_eval": workers_running["final_eval"]
-        },
-        "uptime_seconds": int((datetime.now() - startup_time).total_seconds())
-    }

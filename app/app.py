@@ -21,10 +21,7 @@ from app.generate import (
 from app.finetune_worker import (
     start_finetune_worker,
     stop_finetune_worker,
-    run_finetune_now,
     get_finetune_status,
-    check_finetune_conditions,
-    get_worker_status
 )
 
 # Import evaluation worker functions
@@ -37,7 +34,6 @@ from app.eval_worker import (
     stop_all_workers as stop_all_eval_workers,
     get_worker_status as get_eval_worker_status,
     get_pending_evaluations,
-    check_evaluation_health
 )
 
 # Add project root to path for database access
@@ -112,41 +108,6 @@ async def root():
         "version": "1.0.0",
         "model": MODEL_NAME
     }
-
-
-@app.get("/health")
-async def health_check():
-    """
-    Health check endpoint to monitor service status.
-    
-    Returns:
-        dict: Status of Ollama service, model, and finetune worker
-    """
-    status_info = get_model_status()
-    
-    # Test Supabase connection
-    try:
-        supabase = get_supabase_client()
-        supabase.table("intune_db").select("id").limit(1).execute()
-        supabase_healthy = True
-    except Exception as e:
-        logger.error(f"Supabase health check failed: {e}")
-        supabase_healthy = False
-    
-    # Get finetune status from worker module
-    finetune_status = get_finetune_status()
-    
-    # Get evaluation worker status
-    eval_status = check_evaluation_health()
-    
-    return {
-        "status": "healthy" if status_info["ollama_running"] and status_info["model_loaded"] and supabase_healthy else "degraded",
-        "supabase_connection": supabase_healthy,
-        "finetune_worker": finetune_status,
-        "evaluation_workers": eval_status,
-        **status_info
-    }
-
 
 @app.post("/generate", response_model=PromptResponse)
 async def generate(request: PromptRequest):
@@ -227,7 +188,6 @@ async def start_finetune_worker_endpoint():
             detail=f"Error starting finetune worker: {str(e)}"
         )
 
-
 @app.get("/finetune/status", response_model=FinetuneStatus)
 async def get_finetune_status_endpoint():
     """
@@ -254,7 +214,6 @@ async def get_finetune_status_endpoint():
             detail=f"Error getting finetune status: {str(e)}"
         )
 
-
 @app.post("/finetune/stop", response_model=FinetuneResponse)
 async def stop_finetune_worker_endpoint():
     """
@@ -279,34 +238,6 @@ async def stop_finetune_worker_endpoint():
             detail=f"Error stopping finetune worker: {str(e)}"
         )
 
-
-@app.post("/finetune/run-now")
-async def run_finetune_now_endpoint():
-    """
-    Run fine-tuning immediately without waiting for conditions.
-    
-    This endpoint bypasses the condition checks and runs finetune.py directly.
-    Use with caution - ensure you have sufficient data before running.
-    
-    Returns:
-        dict: Status of the finetune execution
-    """
-    try:
-        result = run_finetune_now()
-        
-        return {
-            "success": result["success"],
-            "message": result["message"]
-        }
-            
-    except Exception as e:
-        logger.error(f"Error in manual finetune execution: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error running finetune: {str(e)}"
-        )
-
-
 # Evaluation Worker Endpoints
 @app.get("/eval/status", response_model=WorkerStatus)
 async def get_eval_worker_status_endpoint():
@@ -326,7 +257,6 @@ async def get_eval_worker_status_endpoint():
             status_code=500,
             detail=f"Error getting evaluation worker status: {str(e)}"
         )
-
 
 @app.post("/eval/start-first-worker")
 async def start_first_eval_worker_endpoint():
@@ -441,22 +371,6 @@ async def stop_all_eval_workers_endpoint():
         raise HTTPException(
             status_code=500,
             detail=f"Error stopping all evaluation workers: {str(e)}"
-        )
-
-
-@app.get("/eval/health")
-async def eval_health_check_endpoint():
-    """Health check for evaluation system."""
-    try:
-        result = check_evaluation_health()
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error checking evaluation health: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error checking evaluation health: {str(e)}"
         )
 
 
