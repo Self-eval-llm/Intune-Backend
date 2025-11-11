@@ -151,7 +151,23 @@ async def generate(request: PromptRequest):
         
         # Generate response
         response_text = generate_response(prompt=request.prompt)
-        
+
+        # Try to insert the prompt and model output into Supabase in a single call
+        try:
+            supabase = get_supabase_client()
+            payload = {
+                "input": request.prompt,
+                "actual_output": response_text
+            }
+            # Insert single row; this creates a new record with both fields set
+            insert_resp = supabase.table("intune_db").insert(payload).execute()
+            # Optionally inspect insert_resp for errors (depends on supabase client)
+            # insert_resp.data contains inserted row(s) on success
+            logger.info("Inserted prompt and output into Supabase intune_db")
+        except Exception as db_e:
+            # Log database errors but do not fail generation
+            logger.error(f"Failed to write to Supabase: {db_e}")
+
         return PromptResponse(
             response=response_text,
             model=MODEL_NAME

@@ -11,6 +11,7 @@ load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 
 def get_supabase_client() -> Client:
@@ -23,9 +24,16 @@ def get_supabase_client() -> Client:
     Raises:
         ValueError: If SUPABASE_URL or SUPABASE_KEY are not set
     """
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in .env file")
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+    # Prefer server-side service role key if available (allows bypassing RLS for trusted backend)
+    key_to_use = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
+
+    if not SUPABASE_URL or not key_to_use:
+        raise ValueError("SUPABASE_URL and SUPABASE_KEY (or SUPABASE_SERVICE_ROLE_KEY) must be set in .env file")
+
+    # If using the anon/public key and your table has Row-Level Security (RLS) enabled,
+    # attempts to insert/update rows may fail with a RLS policy error. For server-side
+    # inserts from a trusted backend, provide the service role key in SUPABASE_SERVICE_ROLE_KEY.
+    return create_client(SUPABASE_URL, key_to_use)
 
 
 def int8_to_decimal(value):
