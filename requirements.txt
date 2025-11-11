@@ -1,0 +1,42 @@
+# Core dependencies for the Self-Learning LLM Framework
+# Install with: pip install -r requirements.txt
+
+# Database and storage
+supabase>=2.0.0
+python-dotenv>=1.0.0
+
+# API framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+
+# HTTP requests
+requests>=2.31.0
+
+# Data processing
+numpy>=1.24.0
+pandas>=2.0.0
+
+# NLP and embeddings
+sentence-transformers>=2.2.0
+nltk>=3.8.0
+
+# Progress bars
+tqdm>=4.66.0
+
+# JSON handling
+jsonlines>=4.0.0
+
+# Optional: For fine-tuning (can be installed separately)
+# torch
+# transformers
+# datasets
+# trl
+# peft
+# accelerate
+# unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
+# bitsandbytes
+# sentencepiece
+# protobuf
+# scikit-learn
+# joblib

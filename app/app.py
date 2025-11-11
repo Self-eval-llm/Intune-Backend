@@ -6,14 +6,14 @@ import os
 import sys
 import logging
 from datetime import datetime
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.generate import (
     start_ollama_service,
     load_model,
     generate_response,
-    get_model_status,
     MODEL_NAME
 )
 
@@ -94,6 +94,14 @@ class EvaluationResult(BaseModel):
     processed_records: int
     message: str
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173","http://localhost:5174","http://localhost:5175", "http://localhost:3000", "http://localhost:8000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.get("/")
 async def root():
@@ -156,6 +164,17 @@ async def generate(request: PromptRequest):
             status_code=500,
             detail=f"Error generating response: {str(e)}"
         )
+
+
+@app.options("/generate")
+async def generate_options():
+    """Handle CORS preflight requests for the /generate endpoint.
+
+    Some clients (PowerShell, browsers) send an OPTIONS preflight. While
+    CORSMiddleware should handle this, add an explicit handler so that
+    callers consistently receive a 200/204 response when preflighting.
+    """
+    return Response(status_code=200)
 
 
 @app.post("/finetune", response_model=FinetuneResponse)

@@ -19,3 +19,9 @@ protobuf
 
 # For better progress bars
 tqdm
+
+# Dynamic LoRA dependencies
+scikit-learn  # For clustering and classification of queries
+nltk  # For text processing and keyword extraction
+numpy  # For numerical operations
+joblib  # For saving/loading models and metadata

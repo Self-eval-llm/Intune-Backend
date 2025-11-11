@@ -253,6 +253,16 @@ class OllamaInferencePipeline:
 
 # Example usage
 if __name__ == "__main__":
+    import os
+    
+    # Get the project root directory (2 levels up from this file)
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(os.path.dirname(current_dir))
+    
+    # Define paths relative to project root
+    input_file = os.path.join(project_root, "data", "raw", "training_dataset.json")
+    output_file = os.path.join(project_root, "data", "raw", "output1.json")
+    
     # Initialize pipeline with Supabase support
     pipeline = OllamaInferencePipeline(
         model_name="gemma3:1b",
@@ -262,8 +272,8 @@ if __name__ == "__main__":
     
     # Process dataset with incremental saving and resume capability
     pipeline.process_dataset(
-        input_file="training_dataset.json",
-        output_file="output1.json",
+        input_file=input_file,
+        output_file=output_file,
         batch_size=5,  # Process 5 items at a time
         delay=1.0,     # 1 second delay between requests
         resume=True    # Resume from where it left off if interrupted

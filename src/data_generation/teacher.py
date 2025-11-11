@@ -330,10 +330,16 @@ Make each example unique, educational, and diverse across different subjects and
 # Example usage
 if __name__ == "__main__":
     import argparse
+    import os
+    
+    # Get the project root directory (2 levels up from this file)
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(os.path.dirname(current_dir))
+    default_output = os.path.join(project_root, "data", "raw", "training_dataset.json")
     
     parser = argparse.ArgumentParser(description='Generate training dataset using Ollama')
     parser.add_argument('--model', default='gpt-oss:20b', help='Ollama model name')
-    parser.add_argument('--outfile', default='training_dataset.json', help='Output file path')
+    parser.add_argument('--outfile', default=default_output, help='Output file path')
     parser.add_argument('--n', type=int, default=5000, help='Number of examples to generate')
     parser.add_argument('--batch-size', type=int, default=15, help='Examples per batch')
     parser.add_argument('--sleep', type=float, default=2.0, help='Sleep time between examples')
