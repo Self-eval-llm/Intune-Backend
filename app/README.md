@@ -43,7 +43,7 @@ python app/app.py
 
 ## 🎯 **UNIFIED API SERVER** (Port 8000)
 
-**🚀 Single Command:** `python app/app.py`  
+**🚀 Single Command:** `python -m app.app`  
 **Base URL:** `http://localhost:8000`  
 **Features:** Model Generation + Finetune Automation + Evaluation Workers
 

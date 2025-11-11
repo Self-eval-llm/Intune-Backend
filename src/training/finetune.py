@@ -7,6 +7,12 @@ Optimized for 8GB VRAM (RTX 4060)
 import os
 import sys
 
+# Fix UTF-8 encoding for Windows (to support emoji characters in print statements)
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 # Disable all multiprocessing to avoid Windows spawn issues
 os.environ["HF_DATASETS_DISABLE_MP"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -23,11 +29,20 @@ os.environ["HF_DATASETS_NUM_PROC"] = "1"
 # Disable Triton/torch.compile (Windows compatibility - Triton has issues on Windows)
 os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
+os.environ["TRITON_DISABLE_LINE_INFO"] = "1"
+os.environ["DISABLE_TRITON"] = "1"
+os.environ["UNSLOTH_DISABLE_TRITON"] = "1"  # Unsloth-specific flag
 
 import json
 from datasets import load_dataset
-from unsloth import FastLanguageModel
+
+# Disable Triton at import time
 import torch
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(False)
+torch.backends.cuda.enable_math_sdp(True)
+
+from unsloth import FastLanguageModel
 
 # Configuration
 MAX_SEQ_LENGTH = 2048  # Max sequence length (can reduce if OOM)
@@ -124,27 +139,46 @@ def setup_model_and_tokenizer():
     print("LOADING MODEL AND APPLYING LORA")
     print("=" * 80)
     
-    # Load model with Unsloth optimizations
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=MODEL_NAME,
-        max_seq_length=MAX_SEQ_LENGTH,
-        dtype=DTYPE,
-        load_in_4bit=LOAD_IN_4BIT,
+    # Use standard transformers instead of Unsloth to avoid Triton requirements
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    
+    # Configure 4-bit quantization
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
     )
+    
+    # Load model without Unsloth optimizations
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        quantization_config=bnb_config,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
     
     print("✓ Model loaded")
     
-    # Apply LoRA
-    model = FastLanguageModel.get_peft_model(
-        model,
+    # Prepare model for k-bit training
+    model = prepare_model_for_kbit_training(model)
+    
+    # Apply LoRA using PEFT
+    lora_config = LoraConfig(
         r=LORA_R,
-        target_modules=TARGET_MODULES,
         lora_alpha=LORA_ALPHA,
+        target_modules=TARGET_MODULES,
         lora_dropout=LORA_DROPOUT,
         bias="none",
-        use_gradient_checkpointing="unsloth",  # Enable gradient checkpointing
-        random_state=3407,
+        task_type="CAUSAL_LM",
     )
+    
+    model = get_peft_model(model, lora_config)
     
     print("✓ LoRA applied")
     print(f"  - Rank: {LORA_R}")
@@ -156,8 +190,7 @@ def setup_model_and_tokenizer():
 
 def train_model(model, tokenizer, dataset):
     """Train the model"""
-    from trl import SFTTrainer
-    from transformers import TrainingArguments
+    from transformers import Trainer, TrainingArguments, DataCollatorForLanguageModeling
     
     print("\n" + "=" * 80)
     print("STARTING TRAINING")
@@ -166,6 +199,12 @@ def train_model(model, tokenizer, dataset):
     # Define checkpoint output directory relative to project root
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
     checkpoint_dir = os.path.join(project_root, 'models', 'gemma-finetuned')
+    
+    # CRITICAL: Disable Unsloth's custom cross-entropy (requires Triton)
+    # Patch model to use standard PyTorch cross-entropy instead
+    if hasattr(model, 'config'):
+        # Disable any cross-entropy optimizations that require Triton
+        model.config.use_cache = False
     
     # Training arguments optimized for 8GB VRAM
     training_args = TrainingArguments(
@@ -192,17 +231,19 @@ def train_model(model, tokenizer, dataset):
         dataloader_num_workers=0,  # Windows compatibility: disable multiprocessing
     )
     
-    # Create trainer
-    trainer = SFTTrainer(
-        model=model,
+    # Create data collator for causal language modeling
+    data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
+        mlm=False  # Causal LM, not masked LM
+    )
+    
+    # Create trainer (use standard Trainer, not SFTTrainer to avoid Triton)
+    trainer = Trainer(
+        model=model,
+        args=training_args,
         train_dataset=dataset["train"],
         eval_dataset=dataset["validation"],
-        dataset_text_field="text",
-        max_seq_length=MAX_SEQ_LENGTH,
-        dataset_num_proc=1,  # Disable multiprocessing (Windows compatibility)
-        packing=False,  # Disable packing for better quality
-        args=training_args,
+        data_collator=data_collator,
     )
     
     # Show GPU memory stats
@@ -243,7 +284,7 @@ def train_model(model, tokenizer, dataset):
 
 
 def save_model(model, tokenizer):
-    """Save fine-tuned merged model and LoRA adapters"""
+    """Save fine-tuned LoRA adapters and optionally merged model"""
     print("\n" + "=" * 80)
     print("SAVING MODEL")
     print("=" * 80)
@@ -257,24 +298,21 @@ def save_model(model, tokenizer):
     # Create models directory if it doesn't exist
     os.makedirs(models_dir, exist_ok=True)
     
-    # Save merged model (standard FP16 HuggingFace format)
-    print("\n1. Merging and saving full model (FP16)...")
-    model.save_pretrained_merged(
-        merged_path,
-        tokenizer,
-        save_method="merged_16bit"  # Creates standard FP16 HF folder
-    )
-    print(f"   ✓ Merged model saved to: {merged_path}")
-    
-    # Save LoRA adapters separately (optional, for future experiments)
-    print("\n2. Saving LoRA adapters separately...")
+    # Save LoRA adapters (lightweight - only trained weights)
+    print("\n1. Saving LoRA adapters...")
     model.save_pretrained(lora_path)
+    tokenizer.save_pretrained(lora_path)
     print(f"   ✓ LoRA adapters saved to: {lora_path}")
     
-    # Save tokenizer explicitly
-    print("\n3. Saving tokenizer...")
+    # Merge and save full model (standard PEFT approach)
+    print("\n2. Merging LoRA weights and saving full model...")
+    from peft import PeftModel
+    
+    # Get base model and merge
+    merged_model = model.merge_and_unload()
+    merged_model.save_pretrained(merged_path)
     tokenizer.save_pretrained(merged_path)
-    print(f"   ✓ Tokenizer saved to: {merged_path}")
+    print(f"   ✓ Merged model saved to: {merged_path}")
     
     print("\n" + "=" * 80)
 
@@ -285,8 +323,8 @@ def test_model(model, tokenizer):
     print("TESTING FINE-TUNED MODEL")
     print("=" * 80)
     
-    # Enable inference mode
-    FastLanguageModel.for_inference(model)
+    # Enable inference mode (standard PyTorch)
+    model.eval()
     
     # Test sample
     test_instruction = "Answer the following question accurately and concisely based on the provided information."
@@ -341,8 +379,25 @@ def main():
         num_proc=1,  # Force single process (Windows compatibility)
     )
     
-    # Setup model
+    # Setup model and tokenizer FIRST
     model, tokenizer = setup_model_and_tokenizer()
+    
+    # Tokenize dataset for standard Trainer (after tokenizer is available)
+    print("\nTokenizing dataset...")
+    def tokenize_function(examples):
+        return tokenizer(
+            examples["text"],
+            truncation=True,
+            max_length=MAX_SEQ_LENGTH,
+            padding="max_length",
+        )
+    
+    dataset = dataset.map(
+        tokenize_function,
+        batched=True,
+        num_proc=1,
+        remove_columns=["instruction", "input", "output", "text"]
+    )
     
     # Train
     trainer = train_model(model, tokenizer, dataset)
