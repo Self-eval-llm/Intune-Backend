@@ -109,7 +109,7 @@ async def generate(request: PromptRequest):
             payload = {
                 "input": request.prompt,
                 "actual_output": response_text,
-                "status_eval_first": "ready"
+                "status_eval_first": "created"
             }
             supabase.table("intune_db").insert(payload).execute()
             logger.info(f"Inserted record to intune_db")
