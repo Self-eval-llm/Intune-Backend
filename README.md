@@ -2,6 +2,23 @@
 
 End-to-end framework for training, evaluating, and iteratively improving Large Language Models.
 
+---
+
+## 📖 **NEW: Comprehensive Architecture Guide**
+
+👉 **[READ ARCHITECTURE.md](ARCHITECTURE.md)** for a complete beginner-friendly guide covering:
+- 🏗️ **System Architecture**: How Backend, Frontend, and Database interconnect
+- 🔄 **Complete Workflow**: Step-by-step data flow from user input to model improvement
+- 🔌 **API Endpoints**: Detailed documentation with examples
+- 🚀 **Setup Guide**: Complete instructions for beginners
+- 🎓 **Key Concepts**: LoRA, evaluation metrics, self-improvement loop explained
+- 🛠️ **Troubleshooting**: Common issues and solutions
+- 📈 **Performance**: Benchmarks and optimization tips
+
+**For a deep dive into how this self-improving LLM framework works, start with [ARCHITECTURE.md](ARCHITECTURE.md)!**
+
+---
+
 ## 🏗️ Project Structure Explained
 
 ### 📁 Directory Layout
@@ -591,5 +608,26 @@ After completing the workflow:
 
 ---
 
+## 📖 Documentation Guide
+
+### New to the Framework?
+Start here:
+1. 📘 **[ARCHITECTURE.md](ARCHITECTURE.md)** - Complete system architecture and beginner's guide
+2. 📗 **[RUNNING.md](RUNNING.md)** - How to run the three worker processes
+3. 📙 **[app/README.md](app/README.md)** - API endpoints documentation
+
+### Quick Reference
+- **Setup**: See [ARCHITECTURE.md - Setup Guide](ARCHITECTURE.md#-setup-guide-for-beginners)
+- **Workflow**: See [ARCHITECTURE.md - Detailed Workflow](ARCHITECTURE.md#-detailed-workflow)
+- **Troubleshooting**: See [ARCHITECTURE.md - Troubleshooting](ARCHITECTURE.md#-troubleshooting)
+- **API Reference**: See [app/README.md](app/README.md)
+
+### Understanding the System
+- **How it works**: [ARCHITECTURE.md - Data Flow](ARCHITECTURE.md#-complete-data-flow)
+- **Self-improvement loop**: [ARCHITECTURE.md - The Loop](ARCHITECTURE.md#-the-self-improvement-loop)
+- **Key concepts**: [ARCHITECTURE.md - Key Concepts](ARCHITECTURE.md#-key-concepts-explained)
+
+---
+
 **Built for LLM research and development** 🚀  
-**Questions? Check the code - it's well-commented!** 📚
+**Questions? Check [ARCHITECTURE.md](ARCHITECTURE.md) for detailed explanations!** 📚
