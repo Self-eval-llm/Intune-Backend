@@ -46,27 +46,97 @@ The persistent data layer that:
 
 ---
 
-## 🔄 Complete Data Flow
+## 🔄 Complete System Architecture
 
-Here's how the three components work together:
+### High-Level Component Diagram
 
 ```
-┌─────────────────┐         ┌──────────────────┐         ┌─────────────────┐
-│                 │ HTTP    │                  │ SQL     │                 │
-│    FRONTEND     │────────▶│     BACKEND      │────────▶│    SUPABASE     │
-│  (User Interface)│ POST   │   (Processing)   │ INSERT  │   (Database)    │
-│                 │         │                  │         │                 │
-└─────────────────┘         └──────────────────┘         └─────────────────┘
-       │                             │                            │
-       │                             │                            │
-       ▼                             ▼                            ▼
-  User types                    1. Generate with               Stores:
-  question in                      Ollama model                - Questions
-  chat UI                       2. Insert to DB                - Answers
-                               3. Evaluate metrics            - Metrics
-                               4. Update DB                   - Status flags
-                               5. Fine-tune when ready
-                               6. Re-evaluate
+┌────────────────────────────────────────────────────────────────────────┐
+│                                                                        │
+│                    SELF-IMPROVING LLM FRAMEWORK                        │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+
+Component 1: FRONTEND                    Component 2: BACKEND
+┌──────────────────────┐                ┌──────────────────────┐
+│                      │                │                      │
+│   User Interface     │    HTTP/REST   │   FastAPI Server     │
+│   (React/Vue)        │◄──────────────►│   (Port 8000)        │
+│                      │                │                      │
+│  - Chat UI           │                │  - /generate         │
+│  - Metrics Dashboard │                │  - /finetune         │
+│  - Progress Display  │                │  - /health           │
+│                      │                │                      │
+└──────────────────────┘                └──────────────────────┘
+                                                  │
+                                                  │
+                                                  ▼
+                                        ┌──────────────────────┐
+                                        │  Evaluation Workers   │
+                                        │  (Port 8001)         │
+                                        │                      │
+                                        │  Worker 1:           │
+                                        │  eval_first.py       │
+                                        │  (Base Metrics)      │
+                                        │                      │
+                                        │  Worker 2:           │
+                                        │  eval_finetune.py    │
+                                        │  (Training + Final)  │
+                                        │                      │
+                                        └──────────────────────┘
+                                                  │
+                                                  │
+                    ┌─────────────────────────────┴─────────────────────────────┐
+                    │                                                           │
+                    ▼                                                           ▼
+Component 3: DATABASE                                            ┌──────────────────────┐
+┌──────────────────────┐                                        │   Ollama Server      │
+│                      │                                        │   (Port 11434)       │
+│   Supabase Cloud     │                                        │                      │
+│   (PostgreSQL)       │                                        │  - Gemma 1B Base     │
+│                      │                                        │  - Gemma Fine-tuned  │
+│  Table: intune_db    │                                        │  - GPT-OSS 20B       │
+│                      │                                        │                      │
+│  - Questions         │                                        └──────────────────────┘
+│  - Answers           │
+│  - Metrics (Base)    │
+│  - Metrics (Tuned)   │
+│  - Status Flags      │
+│                      │
+└──────────────────────┘
+```
+
+### Data Flow Sequence
+
+```
+1. User Question → Frontend
+2. Frontend → POST /generate → Backend API
+3. Backend API → Ollama → Generate Response
+4. Backend API → Insert to Supabase (status: 'created')
+5. eval_first.py Worker → Poll Supabase → Compute Base Metrics → Update DB (status: 'done')
+6. eval_finetune.py Worker → Monitor Record Count → Trigger Training at Threshold
+7. Fine-tuning → Train LoRA Adapters → Create Improved Model
+8. eval_finetune.py → Load Fine-tuned Model → Re-evaluate All Records → Update DB
+9. Frontend → Query Metrics → Display Improvements
+```
+
+### Database Status Flow
+
+```
+Initial Record:
+  status_eval_first = 'created'
+  status_eval_final = NULL
+  (Record ready for base evaluation)
+
+After Base Evaluation:
+  status_eval_first = 'done'
+  status_eval_final = NULL
+  (Metrics computed, ready for fine-tuning)
+
+After Fine-tuning Evaluation:
+  status_eval_first = 'done'
+  status_eval_final = 'done'
+  (Complete cycle finished)
 ```
 
 ---
