@@ -8,15 +8,14 @@
 [![Status](https://img.shields.io/badge/Status-Active-success.svg)]()
 
 ---
+## 👥 Team Members
 
-## Team Members
-
-| Name| ID |
-|---------|------|------|------------------|
-| Radhakrishna Bharuka | 24BDS063 |
-| Abhang Pawar| 24BDS054 |
-| Nilesh Dwivedi | 24BDS048 | 
-| Rushikesh Masalkar 24BDS040 |
+| Name                      | Roll Number |
+|---------------------------|-------------|
+| Radhakrishna Bharuka      | 24BDS063    |
+| Abhang Pawar              | 24BDS054    |
+| Nilesh Dwivedi            | 24BDS048    |
+| Rushikesh Masalkar        | 24BDS040    |
 
 ---
 
