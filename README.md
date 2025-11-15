@@ -9,14 +9,14 @@
 
 ---
 
-## 👥 Team Members
+## Team Members
 
-| Roll No | Name | Role | Responsibilities |
+| Name| ID |
 |---------|------|------|------------------|
-| **Member 1** | [Name] | **Project Lead & Backend Developer** | API design, fine-tuning pipeline, system architecture |
-| **Member 2** | [Name] | **ML Engineer & Evaluation Specialist** | Metrics implementation, model training, LoRA optimization |
-| **Member 3** | [Name] | **Database & Infrastructure Engineer** | Supabase setup, data pipeline, worker orchestration |
-| **Member 4** | [Name] | **Frontend Developer & Documentation** | UI/UX design, API integration, technical documentation |
+| Radhakrishna Bharuka | 24BDS063 |
+| Abhang Pawar| 24BDS054 |
+| Nilesh Dwivedi | 24BDS048 | 
+| Rushikesh Masalkar 24BDS040 |
 
 ---
 
