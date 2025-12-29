@@ -200,6 +200,18 @@ def train_model(model, tokenizer, dataset):
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
     checkpoint_dir = os.path.join(project_root, 'models', 'gemma-finetuned')
     
+    # Find the latest checkpoint to resume from
+    resume_from_checkpoint = None
+    if os.path.exists(checkpoint_dir):
+        checkpoints = [d for d in os.listdir(checkpoint_dir) if d.startswith('checkpoint-')]
+        if checkpoints:
+            # Sort by checkpoint number and get the latest
+            checkpoints.sort(key=lambda x: int(x.split('-')[1]))
+            latest_checkpoint = checkpoints[-1]
+            resume_from_checkpoint = os.path.join(checkpoint_dir, latest_checkpoint)
+            print(f"\n📍 Found existing checkpoint: {latest_checkpoint}")
+            print(f"   Resuming training from: {resume_from_checkpoint}")
+    
     # CRITICAL: Disable Unsloth's custom cross-entropy (requires Triton)
     # Patch model to use standard PyTorch cross-entropy instead
     if hasattr(model, 'config'):
@@ -245,6 +257,15 @@ def train_model(model, tokenizer, dataset):
         eval_dataset=dataset["validation"],
         data_collator=data_collator,
     )
+    
+    # Resume from checkpoint if it exists
+    if resume_from_checkpoint:
+        print(f"\n🔄 Resuming from checkpoint: {resume_from_checkpoint}\n")
+        train_result = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    else:
+        train_result = trainer.train()
+    
+    return trainer, train_result
     
     # Show GPU memory stats
     gpu_stats = torch.cuda.get_device_properties(0)
@@ -400,7 +421,7 @@ def main():
     )
     
     # Train
-    trainer = train_model(model, tokenizer, dataset)
+    trainer, train_result = train_model(model, tokenizer, dataset)
     
     # Save
     save_model(model, tokenizer)

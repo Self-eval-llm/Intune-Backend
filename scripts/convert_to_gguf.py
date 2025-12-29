@@ -9,7 +9,7 @@ import sys
 
 # Configuration - Use paths relative to project root
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-HF_MODEL_PATH = os.path.join(project_root, "models", "gemma-finetuned-merged")
+HF_MODEL_PATH = os.path.join(project_root, "models", "gemma-finetuned-merged-fp16")  # USE FP16 VERSION
 LLAMA_CPP_PATH = os.path.join(project_root, "llama.cpp")
 QUANT_TYPE = "Q4_K_M"  # Good balance of size/quality (Q4_K_M, Q5_K_M, Q8_0, etc.)
 OUTPUT_GGUF_F16 = os.path.join(project_root, "models", "gemma-finetuned-f16.gguf")  # Intermediate F16 GGUF

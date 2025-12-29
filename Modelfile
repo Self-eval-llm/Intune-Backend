@@ -1,4 +1,4 @@
-FROM C:\Users\Radhakrishna\Downloads\llm\models\gemma-finetuned.gguf
+FROM C:\Users\Radhakrishna\Desktop\Intune\Intune_Backend\models\gemma-finetuned.gguf
 
 TEMPLATE """<start_of_turn>user
 {{ .Prompt }}<end_of_turn>

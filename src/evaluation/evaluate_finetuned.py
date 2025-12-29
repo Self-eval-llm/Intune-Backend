@@ -21,7 +21,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from src.metrics.llm_eval import score_datapoint
-from src.database.supabase_client import get_supabase_client, int8_to_decimal
+from src.database.supabase_client import get_supabase_client
 
 # Load environment variables
 load_dotenv()
@@ -29,8 +29,8 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# Fine-tuned model path (relative to project root)
-FINETUNED_MODEL_PATH = os.path.join(project_root, 'models', 'gemma-finetuned-merged')
+# Fine-tuned model path - use the best checkpoint directly
+FINETUNED_MODEL_PATH = os.path.join(project_root, 'models', 'gemma-finetuned', 'checkpoint-1233')
 
 
 # Supabase client now imported from database module
@@ -41,20 +41,42 @@ FINETUNED_MODEL_PATH = os.path.join(project_root, 'models', 'gemma-finetuned-mer
 #     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-def fetch_records_with_metrics(supabase: Client, limit: int = 100) -> List[Dict[str, Any]]:
+def fetch_records_with_metrics(supabase: Client, limit: int = None) -> List[Dict[str, Any]]:
     """Fetch records that have metrics from base model"""
-    print(f"Fetching top {limit} records with existing metrics...")
+    print(f"Fetching records with existing metrics...")
     
-    response = supabase.table("inference_results")\
-        .select("*")\
-        .not_.is_("answer_relevancy", "null")\
-        .order("id")\
-        .limit(limit)\
-        .execute()
+    all_records = []
+    page_size = 1000
+    offset = 0
     
-    records = response.data
-    print(f"✓ Fetched {len(records)} records")
-    return records
+    while True:
+        query = supabase.table("inference_results")\
+            .select("*")\
+            .not_.is_("answer_relevancy", "null")\
+            .order("id")\
+            .range(offset, offset + page_size - 1)
+        
+        if limit and offset >= limit:
+            break
+        
+        response = query.execute()
+        
+        if not response.data:
+            break
+        
+        all_records.extend(response.data)
+        print(f"  Fetched {len(all_records)} records so far...")
+        
+        if len(response.data) < page_size:
+            break
+        
+        offset += page_size
+    
+    if limit:
+        all_records = all_records[:limit]
+    
+    print(f"✓ Total fetched: {len(all_records)} records")
+    return all_records
 
 
 def load_finetuned_model():
@@ -208,21 +230,16 @@ def evaluate_model_on_dataset(model, tokenizer, supabase: Client, records: List[
             # Save to Supabase *_tuned columns
             save_to_supabase(supabase, record_id, finetuned_output, finetuned_metrics)
             
-            # Get base model metrics (convert from INT8)
-            # Debug: Show raw INT8 values
-            raw_overall = record.get('overall')
-            if i <= 3:  # Show first 3 for debugging
-                print(f"  DEBUG - Raw overall from DB (INT8): {raw_overall}")
-            
+            # Get base model metrics (stored as INT8, need to convert)
             base_metrics = {
-                'answer_relevancy': int8_to_decimal(record.get('answer_relevancy')),
-                'contextual_precision': int8_to_decimal(record.get('contextual_precision')),
-                'contextual_recall': int8_to_decimal(record.get('contextual_recall')),
-                'contextual_relevancy': int8_to_decimal(record.get('contextual_relevancy')),
-                'faithfulness': int8_to_decimal(record.get('faithfulness')),
-                'toxicity': int8_to_decimal(record.get('toxicity')),
-                'hallucination_rate': int8_to_decimal(record.get('hallucination_rate')),
-                'overall': int8_to_decimal(record.get('overall'))
+                'answer_relevancy': record.get('answer_relevancy') / 10000.0 if record.get('answer_relevancy') else 0,
+                'contextual_precision': record.get('contextual_precision') / 10000.0 if record.get('contextual_precision') else 0,
+                'contextual_recall': record.get('contextual_recall') / 10000.0 if record.get('contextual_recall') else 0,
+                'contextual_relevancy': record.get('contextual_relevancy') / 10000.0 if record.get('contextual_relevancy') else 0,
+                'faithfulness': record.get('faithfulness') / 10000.0 if record.get('faithfulness') else 0,
+                'toxicity': record.get('toxicity') / 10000.0 if record.get('toxicity') else 0,
+                'hallucination_rate': record.get('hallucination_rate') / 10000.0 if record.get('hallucination_rate') else 0,
+                'overall': record.get('overall') / 10000.0 if record.get('overall') else 0
             }
             
             # Store result
@@ -265,31 +282,31 @@ def fetch_comparison_data(supabase: Client, record_ids: List[int]) -> List[Dict[
     records = response.data
     print(f"✓ Fetched {len(records)} records with both base and tuned metrics")
     
-    # Convert INT8 to decimal for both base and tuned
+    # Prepare comparison data (base metrics are INT8, need conversion)
     comparison_data = []
     for record in records:
         comparison_data.append({
             'id': record['id'],
             'input': record['input'],
             'base_metrics': {
-                'answer_relevancy': int8_to_decimal(record.get('answer_relevancy')),
-                'contextual_precision': int8_to_decimal(record.get('contextual_precision')),
-                'contextual_recall': int8_to_decimal(record.get('contextual_recall')),
-                'contextual_relevancy': int8_to_decimal(record.get('contextual_relevancy')),
-                'faithfulness': int8_to_decimal(record.get('faithfulness')),
-                'toxicity': int8_to_decimal(record.get('toxicity')),
-                'hallucination_rate': int8_to_decimal(record.get('hallucination_rate')),
-                'overall': int8_to_decimal(record.get('overall'))
+                'answer_relevancy': record.get('answer_relevancy') / 10000.0 if record.get('answer_relevancy') else 0,
+                'contextual_precision': record.get('contextual_precision') / 10000.0 if record.get('contextual_precision') else 0,
+                'contextual_recall': record.get('contextual_recall') / 10000.0 if record.get('contextual_recall') else 0,
+                'contextual_relevancy': record.get('contextual_relevancy') / 10000.0 if record.get('contextual_relevancy') else 0,
+                'faithfulness': record.get('faithfulness') / 10000.0 if record.get('faithfulness') else 0,
+                'toxicity': record.get('toxicity') / 10000.0 if record.get('toxicity') else 0,
+                'hallucination_rate': record.get('hallucination_rate') / 10000.0 if record.get('hallucination_rate') else 0,
+                'overall': record.get('overall') / 10000.0 if record.get('overall') else 0
             },
             'finetuned_metrics': {
-                'answer_relevancy': int8_to_decimal(record.get('answer_relevancy_tuned')),
-                'contextual_precision': int8_to_decimal(record.get('contextual_precision_tuned')),
-                'contextual_recall': int8_to_decimal(record.get('contextual_recall_tuned')),
-                'contextual_relevancy': int8_to_decimal(record.get('contextual_relevancy_tuned')),
-                'faithfulness': int8_to_decimal(record.get('faithfulness_tuned')),
-                'toxicity': int8_to_decimal(record.get('toxicity_tuned')),
-                'hallucination_rate': int8_to_decimal(record.get('hallucination_rate_tuned')),
-                'overall': int8_to_decimal(record.get('overall_tuned'))
+                'answer_relevancy': record.get('answer_relevancy_tuned'),
+                'contextual_precision': record.get('contextual_precision_tuned'),
+                'contextual_recall': record.get('contextual_recall_tuned'),
+                'contextual_relevancy': record.get('contextual_relevancy_tuned'),
+                'faithfulness': record.get('faithfulness_tuned'),
+                'toxicity': record.get('toxicity_tuned'),
+                'hallucination_rate': record.get('hallucination_rate_tuned'),
+                'overall': record.get('overall_tuned')
             }
         })
     
@@ -480,13 +497,9 @@ def main():
     print("FINE-TUNED MODEL EVALUATION")
     print("=" * 100)
     
-    # Ask for number of records
-    print("\nHow many records to evaluate?")
-    print("  1. Test on 100 records (recommended)")
-    print("  2. Evaluate on all ~1200 records")
-    choice = input("\nChoice (1 or 2): ").strip()
-    
-    limit = 100 if choice == "1" else 1200
+    # Evaluate all records
+    print("\n📊 Evaluating all records...")
+    limit = None
     
     # Create Supabase client
     supabase = get_supabase_client()
@@ -525,21 +538,15 @@ def main():
     
     print("\n✅ Evaluation completed!")
     
-    # Recommendation
-    if choice == "1":
-        overall_improvement = summary.get('overall', {}).get('avg_improvement_pct', 0)
-        if overall_improvement > 10:
-            print("\n💡 RECOMMENDATION:")
-            print(f"   Model shows {overall_improvement:.2f}% improvement!")
-            print("   Consider running full evaluation on all 1200 records.")
-        elif overall_improvement > 0:
-            print("\n💡 RECOMMENDATION:")
-            print(f"   Model shows modest improvement ({overall_improvement:.2f}%).")
-            print("   You may want to:")
-            print("   - Train for more epochs")
-            print("   - Adjust hyperparameters")
-            print("   - Use more training data")
-        else:
+    # Show overall improvement
+    overall_improvement = summary.get('overall', {}).get('avg_improvement_pct', 0)
+    if overall_improvement > 10:
+        print("\n💡 RESULT:")
+        print(f"   Model shows {overall_improvement:.2f}% improvement! 🎉")
+    elif overall_improvement > 0:
+        print("\n💡 RESULT:")
+        print(f"   Model shows modest improvement ({overall_improvement:.2f}%).")
+    else:
             print("\n⚠️  RECOMMENDATION:")
             print("   Model did not improve. Consider:")
             print("   - Reviewing training data quality")

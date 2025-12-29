@@ -18,7 +18,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from src.metrics.llm_eval import score_datapoint
-from src.database.supabase_client import get_supabase_client, int8_to_decimal
+from src.database.supabase_client import get_supabase_client
 
 # Load environment variables
 load_dotenv()
@@ -45,15 +45,34 @@ def fetch_records(limit: int = None) -> List[Dict[str, Any]]:
     
     print(f"\nFetching records from Supabase...")
     
-    query = supabase.table('inference_results').select('*').order('id')
+    all_records = []
+    page_size = 1000
+    offset = 0
+    
+    while True:
+        query = supabase.table('inference_results').select('*').order('id').range(offset, offset + page_size - 1)
+        
+        if limit and offset >= limit:
+            break
+        
+        response = query.execute()
+        
+        if not response.data:
+            break
+        
+        all_records.extend(response.data)
+        print(f"  Fetched {len(all_records)} records so far...")
+        
+        if len(response.data) < page_size:
+            break
+        
+        offset += page_size
     
     if limit:
-        query = query.limit(limit)
+        all_records = all_records[:limit]
     
-    response = query.execute()
-    
-    print(f"✓ Fetched {len(response.data)} records")
-    return response.data
+    print(f"✓ Total fetched: {len(all_records)} records")
+    return all_records
 
 
 def format_prompt(input_text: str, context: Any) -> str:
@@ -146,26 +165,21 @@ def compute_metrics(record: Dict[str, Any], generated_output: str) -> Dict[str, 
     return metrics
 
 
-def to_int8(value: float) -> int:
-    """Convert float metric to INT8 format (multiply by 10000)"""
-    return int(round(value * 10000))
-
-
 def save_to_supabase(record_id: int, output: str, metrics: Dict[str, float]):
     """Save generated output and metrics to Supabase *_tuned columns"""
     supabase = get_supabase_client()
     
-    # Prepare update data with INT8 conversion
+    # Prepare update data - save as regular floats
     update_data = {
         'actual_output_tuned': output,
-        'answer_relevancy_tuned': to_int8(metrics.get('answer_relevancy', 0)),
-        'contextual_precision_tuned': to_int8(metrics.get('contextual_precision', 0)),
-        'contextual_recall_tuned': to_int8(metrics.get('contextual_recall', 0)),
-        'contextual_relevancy_tuned': to_int8(metrics.get('contextual_relevancy', 0)),
-        'faithfulness_tuned': to_int8(metrics.get('faithfulness', 0)),
-        'toxicity_tuned': to_int8(metrics.get('toxicity', 0)),
-        'hallucination_rate_tuned': to_int8(metrics.get('hallucination_rate', 0)),
-        'overall_tuned': to_int8(metrics.get('overall', 0)),
+        'answer_relevancy_tuned': metrics.get('answer_relevancy', 0),
+        'contextual_precision_tuned': metrics.get('contextual_precision', 0),
+        'contextual_recall_tuned': metrics.get('contextual_recall', 0),
+        'contextual_relevancy_tuned': metrics.get('contextual_relevancy', 0),
+        'faithfulness_tuned': metrics.get('faithfulness', 0),
+        'toxicity_tuned': metrics.get('toxicity', 0),
+        'hallucination_rate_tuned': metrics.get('hallucination_rate', 0),
+        'overall_tuned': metrics.get('overall', 0),
         'updated_at': datetime.now().isoformat()
     }
     
@@ -252,9 +266,9 @@ def calculate_average_improvements(records: List[Dict[str, Any]]) -> Dict[str, f
             tuned_val = record.get(f"{metric}_tuned")
             
             if base_val is not None and tuned_val is not None:
-                # Convert from INT8 to float
+                # Base metrics are INT8, need conversion; tuned are already floats
                 base_values.append(base_val / 10000.0)
-                tuned_values.append(tuned_val / 10000.0)
+                tuned_values.append(tuned_val)
         
         if base_values and tuned_values:
             avg_base = sum(base_values) / len(base_values)
@@ -329,22 +343,9 @@ def main():
         print("\n❌ Cannot connect to Ollama. Please ensure Ollama is running.")
         return
     
-    # Ask user how many records to evaluate
-    print("\nHow many records do you want to evaluate?")
-    print("  1. Top 100 records (quick test)")
-    print("  2. All 1200+ records (full evaluation)")
-    
-    choice = input("\nEnter choice (1 or 2): ").strip()
-    
-    if choice == '1':
-        limit = 100
-        print(f"\n📊 Evaluating top {limit} records...")
-    elif choice == '2':
-        limit = None
-        print("\n📊 Evaluating all records...")
-    else:
-        print("Invalid choice. Exiting.")
-        return
+    # Evaluate all records
+    print("\n📊 Evaluating all records...")
+    limit = None
     
     # Fetch records
     records = fetch_records(limit)
