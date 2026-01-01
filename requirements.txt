@@ -28,15 +28,15 @@ tqdm>=4.66.0
 jsonlines>=4.0.0
 
 # Optional: For fine-tuning (can be installed separately)
-# torch
-# transformers
-# datasets
-# trl
-# peft
-# accelerate
-# unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
-# bitsandbytes
-# sentencepiece
-# protobuf
-# scikit-learn
-# joblib
+torch
+transformers
+datasets
+trl
+peft
+accelerate
+unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
+bitsandbytes
+sentencepiece
+protobuf
+scikit-learn
+joblib

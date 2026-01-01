@@ -92,17 +92,37 @@ def build_prompt(input_text: str, context: str = None) -> str:
 
 
 def fetch_pending_records(supabase) -> list:
-    """Fetch records where twentyb is NULL"""
-    try:
-        response = supabase.table("modelComp")\
-            .select("id, input, context")\
-            .is_("twentyb", "null")\
-            .order("id")\
-            .execute()
-        return response.data
-    except Exception as e:
-        print(f"  Error fetching records: {e}")
-        return []
+    """Fetch ALL records where twentyb is NULL with pagination"""
+    print("Fetching pending records from Supabase...")
+    all_records = []
+    page_size = 1000
+    offset = 0
+    
+    while True:
+        try:
+            response = supabase.table("modelComp")\
+                .select("id, input, context")\
+                .is_("twentyb", "null")\
+                .order("id")\
+                .range(offset, offset + page_size - 1)\
+                .execute()
+            
+            if not response.data:
+                break
+            
+            all_records.extend(response.data)
+            print(f"  Fetched page {offset // page_size + 1}: {len(response.data)} records")
+            
+            if len(response.data) < page_size:
+                break
+            
+            offset += page_size
+        except Exception as e:
+            print(f"  Error fetching records: {e}")
+            break
+    
+    print(f"✓ Total pending records: {len(all_records)}")
+    return all_records
 
 
 def update_twentyb(supabase, record_id: int, output: str):
