@@ -1,20 +1,27 @@
 """
 Step 06b: Generate Tuned-OSS20B Outputs for Teacher Comparison
 ==============================================================
-Generates outputs from the Gemma model fine-tuned on OSS-20B data.
+Generates outputs from the Gemma model fine-tuned on OSS-20B synthetic data.
 Updates `tuned_oss20b` column in modelComp table.
 
-⚠️ Runs on MacBook Pro (24GB Apple Silicon)
+⚠️ Runs on MacBook Pro (M1/M2/M3)
+
+Features:
+- BATCH INFERENCE for 3-5x faster generation
+- Supports Transformers, MLX, and Ollama backends
+- Resume-safe (only processes NULL records)
 
 Prerequisites:
-- Fine-tuned model at: models/gemma-oss20b-teacher/
-- Or via Ollama: gemma-oss-tuned
+- Fine-tuned model at: models/gemma-oss-teacher/
+- Or merged model for MLX/Ollama
 
 Usage:
     python experiment/06b_generate_tuned_oss.py
-    python experiment/06b_generate_tuned_oss.py --limit 100  # Test with subset
-    python experiment/06b_generate_tuned_oss.py --use-ollama --model gemma-oss-tuned
-    python experiment/06b_generate_tuned_oss.py --use-mlx  # Use MLX for Apple Silicon
+    python experiment/06b_generate_tuned_oss.py --limit 100  # Test subset
+    python experiment/06b_generate_tuned_oss.py --batch-size 8  # Batch inference
+    python experiment/06b_generate_tuned_oss.py --use-ollama  # Use Ollama
+    python experiment/06b_generate_tuned_oss.py --use-mlx  # Use MLX (Apple Silicon)
+    python experiment/06b_generate_tuned_oss.py --use-transformers  # Use Transformers
 """
 
 import os
@@ -22,7 +29,7 @@ import sys
 import time
 import argparse
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -34,17 +41,19 @@ from tqdm import tqdm
 load_dotenv()
 
 # Model paths
-FINETUNED_MODEL_PATH = PROJECT_ROOT / "models" / "gemma-oss20b-teacher"
-MERGED_MODEL_PATH = PROJECT_ROOT / "models" / "gemma-oss20b-merged"
+FINETUNED_MODEL_PATH = PROJECT_ROOT / "models" / "gemma-oss-teacher"
+MERGED_MODEL_PATH = PROJECT_ROOT / "models" / "gemma-oss-merged"
+MLX_MODEL_PATH = PROJECT_ROOT / "models" / "gemma-oss-mlx"
 
 # Generation config
 MAX_NEW_TOKENS = 512
 TEMPERATURE = 0.7
 TOP_P = 0.9
+DEFAULT_BATCH_SIZE = 4  # Adjust based on MacBook memory
 
 # Ollama config
 OLLAMA_URL = "http://localhost:11434"
-OLLAMA_MODEL = "gemma-oss-tuned"  # Custom model name
+OLLAMA_MODEL = "gemma-oss-tuned"  # Custom model name in Ollama
 
 
 def get_supabase_client():
@@ -115,8 +124,181 @@ def build_prompt(input_text: str, context: Optional[str] = None) -> str:
     return f"Question: {input_text}\n\nAnswer:"
 
 
+def prepare_batch(records: List[Dict[str, Any]]) -> List[Tuple[int, str]]:
+    """Prepare a batch of prompts from records"""
+    batch = []
+    for record in records:
+        record_id = record["id"]
+        input_text = record["input"]
+        context = record.get("context")
+        
+        # Handle context array
+        if isinstance(context, list):
+            context = " ".join(str(c) for c in context if c)
+        
+        prompt = build_prompt(input_text, context)
+        batch.append((record_id, prompt))
+    
+    return batch
+
+
 # ============================================================================
-# OLLAMA GENERATION (Primary method for MacBook)
+# TRANSFORMERS GENERATION (Primary method for MacBook)
+# ============================================================================
+
+def load_transformers_model(model_path: str):
+    """Load model using Transformers with MPS (Apple Silicon)"""
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        
+        print(f"\nLoading Transformers model from: {model_path}")
+        
+        # Detect device
+        if torch.backends.mps.is_available():
+            device_map = {"": "mps"}
+            dtype = torch.float16
+            print("  Using Apple MPS acceleration")
+        else:
+            device_map = "auto"
+            dtype = torch.float32
+            print("  Using CPU")
+        
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        
+        # Ensure padding token is set
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=dtype,
+            device_map=device_map,
+        )
+        
+        print("✓ Transformers model loaded\n")
+        return model, tokenizer
+    except Exception as e:
+        print(f"✗ Error loading model: {e}")
+        return None, None
+
+
+def generate_with_transformers_batch(
+    model,
+    tokenizer,
+    prompts: List[str],
+    max_new_tokens: int = MAX_NEW_TOKENS
+) -> List[Optional[str]]:
+    """Generate responses using Transformers (BATCH)"""
+    try:
+        inputs = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=2048 - max_new_tokens,
+        ).to(model.device)
+        
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=TEMPERATURE,
+            top_p=TOP_P,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        
+        responses = []
+        for output in outputs:
+            response = tokenizer.decode(output, skip_special_tokens=True)
+            if "Answer:" in response:
+                response = response.split("Answer:")[-1].strip()
+            responses.append(response)
+        
+        return responses
+        
+    except Exception as e:
+        print(f"\n  ✗ Transformers batch error: {e}")
+        return [None] * len(prompts)
+
+
+def generate_with_transformers_single(
+    model,
+    tokenizer,
+    prompt: str,
+    max_new_tokens: int = MAX_NEW_TOKENS
+) -> Optional[str]:
+    """Generate response using Transformers (single)"""
+    results = generate_with_transformers_batch(model, tokenizer, [prompt], max_new_tokens)
+    return results[0] if results else None
+
+
+# ============================================================================
+# MLX GENERATION (Apple Silicon native)
+# ============================================================================
+
+def load_mlx_model(model_path: str):
+    """Load model using MLX (Apple Silicon)"""
+    try:
+        from mlx_lm import load, generate
+        
+        print(f"\nLoading MLX model from: {model_path}")
+        model, tokenizer = load(model_path)
+        print("✓ MLX model loaded\n")
+        return model, tokenizer, generate
+    except ImportError:
+        print("✗ MLX not installed. Install with: pip install mlx-lm")
+        return None, None, None
+    except Exception as e:
+        print(f"✗ Error loading MLX model: {e}")
+        return None, None, None
+
+
+def generate_with_mlx_single(
+    model,
+    tokenizer,
+    generate_fn,
+    prompt: str,
+    max_new_tokens: int = MAX_NEW_TOKENS
+) -> Optional[str]:
+    """Generate response using MLX (single - MLX uses streaming)"""
+    try:
+        response = generate_fn(
+            model,
+            tokenizer,
+            prompt=prompt,
+            max_tokens=max_new_tokens,
+            temp=TEMPERATURE,
+            top_p=TOP_P,
+            verbose=False,
+        )
+        
+        if "Answer:" in response:
+            response = response.split("Answer:")[-1].strip()
+        
+        return response
+    except Exception as e:
+        print(f"\n  ✗ MLX error: {e}")
+        return None
+
+
+def generate_with_mlx_batch(
+    model,
+    tokenizer,
+    generate_fn,
+    prompts: List[str],
+    max_new_tokens: int = MAX_NEW_TOKENS
+) -> List[Optional[str]]:
+    """Generate responses using MLX (sequential - MLX doesn't support true batch)"""
+    responses = []
+    for prompt in prompts:
+        response = generate_with_mlx_single(model, tokenizer, generate_fn, prompt, max_new_tokens)
+        responses.append(response)
+    return responses
+
+
+# ============================================================================
+# OLLAMA GENERATION
 # ============================================================================
 
 def check_ollama_model(model_name: str = OLLAMA_MODEL) -> bool:
@@ -125,16 +307,13 @@ def check_ollama_model(model_name: str = OLLAMA_MODEL) -> bool:
     try:
         response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=10)
         models = response.json().get("models", [])
-        model_names = [m.get("name", "") for m in models]
-        print(f"  Available models: {model_names[:5]}...")
-        return any(model_name in m for m in model_names)
-    except Exception as e:
-        print(f"  Connection error: {e}")
+        return any(model_name in m.get("name", "") for m in models)
+    except:
         return False
 
 
 def generate_with_ollama(prompt: str, model_name: str = OLLAMA_MODEL) -> Optional[str]:
-    """Generate response using Ollama"""
+    """Generate response using Ollama (single - Ollama doesn't support batch)"""
     import requests
     try:
         response = requests.post(
@@ -159,113 +338,25 @@ def generate_with_ollama(prompt: str, model_name: str = OLLAMA_MODEL) -> Optiona
 
 
 # ============================================================================
-# MLX GENERATION (Alternative for Apple Silicon)
-# ============================================================================
-
-def load_mlx_model(model_path: str):
-    """Load model using MLX for Apple Silicon"""
-    try:
-        from mlx_lm import load, generate
-        print(f"\nLoading MLX model from: {model_path}")
-        model, tokenizer = load(model_path)
-        print("✓ MLX model loaded\n")
-        return model, tokenizer
-    except ImportError:
-        print("✗ MLX not installed. Install with: pip install mlx-lm")
-        return None, None
-
-
-def generate_with_mlx(model, tokenizer, prompt: str) -> Optional[str]:
-    """Generate response using MLX"""
-    try:
-        from mlx_lm import generate
-        response = generate(
-            model,
-            tokenizer,
-            prompt=prompt,
-            max_tokens=MAX_NEW_TOKENS,
-            temp=TEMPERATURE,
-            top_p=TOP_P,
-        )
-        
-        # Extract only the generated part
-        if "Answer:" in response:
-            response = response.split("Answer:")[-1].strip()
-        
-        return response
-    except Exception as e:
-        print(f"\n  ✗ MLX error: {e}")
-        return None
-
-
-# ============================================================================
-# TRANSFORMERS GENERATION (Fallback)
-# ============================================================================
-
-def load_transformers_model(model_path: str):
-    """Load model using Transformers (slower but compatible)"""
-    try:
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        
-        print(f"\nLoading Transformers model from: {model_path}")
-        
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=torch.float16,
-            device_map="auto",
-        )
-        
-        print("✓ Transformers model loaded\n")
-        return model, tokenizer
-    except Exception as e:
-        print(f"✗ Error loading model: {e}")
-        return None, None
-
-
-def generate_with_transformers(model, tokenizer, prompt: str) -> Optional[str]:
-    """Generate response using Transformers"""
-    try:
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-        
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=MAX_NEW_TOKENS,
-            temperature=TEMPERATURE,
-            top_p=TOP_P,
-            do_sample=True,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-        
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        if "Answer:" in response:
-            response = response.split("Answer:")[-1].strip()
-        
-        return response
-    except Exception as e:
-        print(f"\n  ✗ Transformers error: {e}")
-        return None
-
-
-# ============================================================================
 # MAIN
 # ============================================================================
 
 def main():
     parser = argparse.ArgumentParser(description="Generate tuned_oss20b outputs")
     parser.add_argument("--limit", type=int, help="Limit number of records")
-    parser.add_argument("--use-ollama", action="store_true", help="Use Ollama (recommended)")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
+                       help=f"Batch size for inference (default: {DEFAULT_BATCH_SIZE})")
+    parser.add_argument("--use-ollama", action="store_true", help="Use Ollama (no batch)")
     parser.add_argument("--use-mlx", action="store_true", help="Use MLX for Apple Silicon")
-    parser.add_argument("--model", type=str, default=OLLAMA_MODEL, help="Model name")
-    parser.add_argument("--model-path", type=str, help="Path to model (for MLX/Transformers)")
+    parser.add_argument("--use-transformers", action="store_true", help="Use Transformers")
+    parser.add_argument("--model-path", type=str, help="Custom model path")
     args = parser.parse_args()
     
     print("\n" + "=" * 70)
     print("STEP 06b: GENERATE TUNED-OSS20B OUTPUTS")
     print("=" * 70)
     print("⚠️  Running on MacBook Pro (Apple Silicon)")
+    print(f"📦 Batch Size: {args.batch_size}")
     
     # Connect to Supabase
     try:
@@ -282,78 +373,120 @@ def main():
         print("✓ All records already have tuned_oss20b outputs!")
         return
     
-    # Determine generation method
-    model = None
-    tokenizer = None
+    # Determine model path
+    if args.model_path:
+        model_path = Path(args.model_path)
+    elif args.use_mlx:
+        model_path = MLX_MODEL_PATH
+    else:
+        model_path = FINETUNED_MODEL_PATH
+    
+    # Initialize model and set generation function
+    batch_generate_fn = None
+    single_generate_fn = None
+    use_batch = True
     
     if args.use_ollama:
-        print(f"\nUsing Ollama model: {args.model}")
-        if not check_ollama_model(args.model):
-            print(f"\n✗ Model '{args.model}' not found in Ollama!")
-            print("\nTo create a custom model, create a Modelfile and run:")
-            print(f"  ollama create {args.model} -f Modelfile")
-            print("\nOr use an existing model:")
-            print("  python 06b_generate_tuned_oss.py --use-ollama --model gemma2:2b")
+        print(f"\nUsing Ollama model: {OLLAMA_MODEL}")
+        print("⚠️  Ollama doesn't support batch inference - using single mode")
+        if not check_ollama_model():
+            print(f"✗ Model '{OLLAMA_MODEL}' not found in Ollama!")
+            print("\nTo create, run:")
+            print(f"  ollama create {OLLAMA_MODEL} -f Modelfile")
             return
-        generate_fn = lambda prompt: generate_with_ollama(prompt, args.model)
+        single_generate_fn = lambda prompt: generate_with_ollama(prompt)
+        use_batch = False
         
     elif args.use_mlx:
-        model_path = args.model_path or str(MERGED_MODEL_PATH)
-        model, tokenizer = load_mlx_model(model_path)
+        model, tokenizer, generate_fn = load_mlx_model(str(model_path))
         if model is None:
             return
-        generate_fn = lambda prompt: generate_with_mlx(model, tokenizer, prompt)
+        print("⚠️  MLX uses sequential generation (no true batch)")
+        batch_generate_fn = lambda prompts: generate_with_mlx_batch(model, tokenizer, generate_fn, prompts)
+        single_generate_fn = lambda prompt: generate_with_mlx_single(model, tokenizer, generate_fn, prompt)
+        
+    elif args.use_transformers:
+        model, tokenizer = load_transformers_model(str(model_path))
+        if model is None:
+            return
+        batch_generate_fn = lambda prompts: generate_with_transformers_batch(model, tokenizer, prompts)
+        single_generate_fn = lambda prompt: generate_with_transformers_single(model, tokenizer, prompt)
         
     else:
-        # Default to Ollama as it's easiest on Mac
-        print("\nDefaulting to Ollama (recommended for MacBook)")
-        print("Use --use-mlx for MLX or --use-ollama for explicit Ollama")
-        
-        if not check_ollama_model(args.model):
-            print(f"\n✗ Model '{args.model}' not found!")
-            print("\nOptions:")
-            print("  1. Create custom Ollama model from fine-tuned weights")
-            print("  2. Use existing model: --model gemma2:2b")
-            print("  3. Use MLX: --use-mlx --model-path path/to/model")
+        # Default: Transformers (safest for MacBook)
+        print("\nNo backend specified, using Transformers (default for MacBook)")
+        model, tokenizer = load_transformers_model(str(model_path))
+        if model is None:
+            print("Try --use-ollama or --use-mlx instead")
             return
-        generate_fn = lambda prompt: generate_with_ollama(prompt, args.model)
+        batch_generate_fn = lambda prompts: generate_with_transformers_batch(model, tokenizer, prompts)
+        single_generate_fn = lambda prompt: generate_with_transformers_single(model, tokenizer, prompt)
     
     # Generate outputs
     print(f"\nGenerating {len(records)} tuned_oss20b outputs...")
+    if use_batch:
+        print(f"🚀 Using BATCH inference (batch_size={args.batch_size})")
+    else:
+        print("🐢 Using single inference (slower)")
     print("-" * 70)
     
     start_time = time.time()
     success_count = 0
     fail_count = 0
     
-    for record in tqdm(records, desc="Tuned-OSS20B Generation"):
-        record_id = record["id"]
-        input_text = record["input"]
-        context = record.get("context")
-        
-        # Handle context array
-        if isinstance(context, list):
-            context = " ".join(str(c) for c in context if c)
-        
-        # Build prompt
-        prompt = build_prompt(input_text, context)
-        
-        # Generate
-        output = generate_fn(prompt)
-        
-        if output:
-            if update_tuned_oss(supabase, record_id, output):
-                success_count += 1
+    if use_batch and batch_generate_fn:
+        # BATCH PROCESSING
+        for i in tqdm(range(0, len(records), args.batch_size), desc="Batch Generation"):
+            batch_records = records[i:i + args.batch_size]
+            batch_data = prepare_batch(batch_records)
+            
+            prompts = [p for _, p in batch_data]
+            record_ids = [rid for rid, _ in batch_data]
+            
+            # Generate batch
+            outputs = batch_generate_fn(prompts)
+            
+            # Update database
+            for record_id, output in zip(record_ids, outputs):
+                if output:
+                    if update_tuned_oss(supabase, record_id, output):
+                        success_count += 1
+                    else:
+                        fail_count += 1
+                else:
+                    fail_count += 1
+            
+            # Progress update
+            total_done = success_count + fail_count
+            if total_done % 50 == 0:
+                elapsed = time.time() - start_time
+                rate = total_done / elapsed * 60
+                tqdm.write(f"  ⚡ Rate: {rate:.1f} samples/min | Success: {success_count}")
+    else:
+        # SINGLE PROCESSING (for Ollama)
+        for record in tqdm(records, desc="Single Generation"):
+            record_id = record["id"]
+            input_text = record["input"]
+            context = record.get("context")
+            
+            if isinstance(context, list):
+                context = " ".join(str(c) for c in context if c)
+            
+            prompt = build_prompt(input_text, context)
+            output = single_generate_fn(prompt)
+            
+            if output:
+                if update_tuned_oss(supabase, record_id, output):
+                    success_count += 1
+                else:
+                    fail_count += 1
             else:
                 fail_count += 1
-        else:
-            fail_count += 1
-        
-        # Progress update
-        if (success_count + fail_count) % 10 == 0:
-            elapsed = time.time() - start_time
-            rate = (success_count + fail_count) / elapsed * 60
-            tqdm.write(f"  ⚡ Rate: {rate:.1f} samples/min | Success: {success_count}")
+            
+            if (success_count + fail_count) % 10 == 0:
+                elapsed = time.time() - start_time
+                rate = (success_count + fail_count) / elapsed * 60
+                tqdm.write(f"  ⚡ Rate: {rate:.1f} samples/min | Success: {success_count}")
     
     elapsed = time.time() - start_time
     
@@ -365,8 +498,7 @@ def main():
     print(f"⏱  Time:   {elapsed/60:.1f} minutes")
     print(f"⚡ Rate:   {success_count/elapsed*60:.1f} samples/min")
     print("=" * 70)
-    print("\n→ Next: Run 07_compare_teachers.py to compare both teachers")
-    print("→ Then: Select the better teacher for 50K Gemma 3 fine-tuning")
+    print("\n→ Next: Run 07_compare_teachers.py to select best teacher")
 
 
 if __name__ == "__main__":
