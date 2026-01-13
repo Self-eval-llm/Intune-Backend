@@ -122,6 +122,7 @@ def update_record_metrics(
     record_id: int,
     alpaca_metrics: Dict[str, float],
     oss_metrics: Dict[str, float],
+    winner: str = "tie",
     dry_run: bool = False
 ) -> bool:
     """Update a record with new evaluation metrics"""
@@ -149,6 +150,10 @@ def update_record_metrics(
             "oss_hallucination": to_int8(oss_metrics.get("hallucination", 0)),
             "oss_ctx_grounding": to_int8(oss_metrics.get("context_grounding", 0)),
             "oss_overall": to_int8(oss_metrics.get("overall_score", 0)),
+            
+            # Status and winner
+            "eval_status": "completed",
+            "eval_winner": winner,
         }
         
         supabase.table("modelComp").update(update_data).eq("id", record_id).execute()
@@ -172,7 +177,8 @@ def evaluate_record(record: Dict[str, Any]) -> Dict[str, Any]:
     instruction = ensure_string(record.get("input", ""))
     context_raw = record.get("context", [])
     context = ensure_string(context_raw) if context_raw else ""
-    reference = ensure_string(record.get("output", ""))  # Original reference
+    # Try both column names (actual_output or output)
+    reference = ensure_string(record.get("actual_output", "") or record.get("output", ""))
     task_label = record.get("label", "general_qa")
     
     alpaca_output = ensure_string(record.get("tuned_alpaca", ""))
@@ -199,6 +205,7 @@ def evaluate_record(record: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": record.get("id"),
         "label": task_label,
+        "has_context": bool(context and context.strip()),  # Track context availability
         "alpaca": alpaca_metrics,
         "oss": oss_metrics,
         "alpaca_wins": alpaca_metrics["overall_score"] > oss_metrics["overall_score"],
@@ -316,13 +323,66 @@ def calculate_overall_winner(aggregated: Dict[str, Dict[str, Any]]) -> Dict[str,
     }
 
 
+def aggregate_by_context(results: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Split results by context availability (with_context vs without_context).
+    Returns aggregated stats for each group.
+    """
+    with_context = [r for r in results if r.get("has_context", False)]
+    without_context = [r for r in results if not r.get("has_context", False)]
+    
+    def compute_stats(subset: List[Dict[str, Any]], name: str) -> Dict[str, Any]:
+        if not subset:
+            return {"name": name, "count": 0}
+        
+        alpaca_wins = sum(1 for r in subset if r["alpaca_wins"])
+        oss_wins = sum(1 for r in subset if r["difference"] < 0)
+        ties = len(subset) - alpaca_wins - oss_wins
+        
+        alpaca_overall = sum(r["alpaca"]["overall_score"] for r in subset) / len(subset)
+        oss_overall = sum(r["oss"]["overall_score"] for r in subset) / len(subset)
+        
+        # Context-specific metrics
+        alpaca_ctx_ground = sum(r["alpaca"].get("context_grounding", 0) for r in subset) / len(subset)
+        oss_ctx_ground = sum(r["oss"].get("context_grounding", 0) for r in subset) / len(subset)
+        alpaca_halluc = sum(r["alpaca"].get("hallucination", 0) for r in subset) / len(subset)
+        oss_halluc = sum(r["oss"].get("hallucination", 0) for r in subset) / len(subset)
+        alpaca_faith = sum(r["alpaca"].get("faithfulness", 0) for r in subset) / len(subset)
+        oss_faith = sum(r["oss"].get("faithfulness", 0) for r in subset) / len(subset)
+        
+        winner = "alpaca" if alpaca_overall > oss_overall else ("oss" if oss_overall > alpaca_overall else "tie")
+        
+        return {
+            "name": name,
+            "count": len(subset),
+            "alpaca_wins": alpaca_wins,
+            "oss_wins": oss_wins,
+            "ties": ties,
+            "alpaca_overall": round(alpaca_overall, 4),
+            "oss_overall": round(oss_overall, 4),
+            "alpaca_ctx_grounding": round(alpaca_ctx_ground, 4),
+            "oss_ctx_grounding": round(oss_ctx_ground, 4),
+            "alpaca_hallucination": round(alpaca_halluc, 4),
+            "oss_hallucination": round(oss_halluc, 4),
+            "alpaca_faithfulness": round(alpaca_faith, 4),
+            "oss_faithfulness": round(oss_faith, 4),
+            "winner": winner,
+        }
+    
+    return {
+        "with_context": compute_stats(with_context, "With Context"),
+        "without_context": compute_stats(without_context, "Without Context"),
+    }
+
+
 # ============================================================================
 # REPORT GENERATION
 # ============================================================================
 
 def print_comparison_report(
     aggregated: Dict[str, Dict[str, Any]],
-    overall: Dict[str, Any]
+    overall: Dict[str, Any],
+    context_split: Dict[str, Dict[str, Any]] = None
 ):
     """Print formatted comparison report"""
     print("\n" + "=" * 80)
@@ -401,6 +461,29 @@ def print_comparison_report(
         
         print(f"{metric_name:<20} {alpaca_avg:>10.4f} {oss_avg:>10.4f} {diff:>+10.4f} {better:>10}")
     
+    # Context split analysis
+    if context_split:
+        print("\n\n📋 CONTEXT ANALYSIS: WITH vs WITHOUT CONTEXT")
+        print("=" * 80)
+        
+        for key in ["with_context", "without_context"]:
+            stats = context_split.get(key, {})
+            if stats.get("count", 0) == 0:
+                continue
+            
+            print(f"\n🔹 {stats['name'].upper()} ({stats['count']} records)")
+            print("-" * 50)
+            print(f"  Alpaca Wins: {stats['alpaca_wins']} | OSS Wins: {stats['oss_wins']} | Ties: {stats['ties']}")
+            print(f"  Alpaca Overall: {stats['alpaca_overall']:.4f}")
+            print(f"  OSS-20B Overall: {stats['oss_overall']:.4f}")
+            print(f"  🏆 Winner: {stats['winner'].upper()}")
+            
+            if key == "with_context":
+                print(f"\n  Context-Specific Metrics:")
+                print(f"    Context Grounding: Alpaca={stats['alpaca_ctx_grounding']:.4f} | OSS={stats['oss_ctx_grounding']:.4f}")
+                print(f"    Hallucination:     Alpaca={stats['alpaca_hallucination']:.4f} | OSS={stats['oss_hallucination']:.4f}")
+                print(f"    Faithfulness:      Alpaca={stats['alpaca_faithfulness']:.4f} | OSS={stats['oss_faithfulness']:.4f}")
+    
     print("\n" + "=" * 80)
 
 
@@ -408,12 +491,14 @@ def save_report_json(
     results: List[Dict[str, Any]],
     aggregated: Dict[str, Dict[str, Any]],
     overall: Dict[str, Any],
+    context_split: Dict[str, Dict[str, Any]],
     output_path: str
 ):
     """Save detailed report as JSON"""
     report = {
         "generated_at": datetime.now().isoformat(),
         "overall": overall,
+        "context_split": context_split,
         "by_category": {
             cat: {
                 "count": stats["count"],
@@ -472,6 +557,14 @@ def main():
             result = evaluate_record(record)
             results.append(result)
             
+            # Determine winner for this record
+            if result["alpaca_wins"]:
+                winner = "alpaca"
+            elif result["difference"] < 0:
+                winner = "oss"
+            else:
+                winner = "tie"
+            
             # Update database (if not dry-run)
             if not args.dry_run and not args.no_update:
                 update_record_metrics(
@@ -479,6 +572,7 @@ def main():
                     record["id"],
                     result["alpaca"],
                     result["oss"],
+                    winner=winner,
                     dry_run=False
                 )
         except Exception as e:
@@ -494,13 +588,17 @@ def main():
     aggregated = aggregate_by_category(results)
     overall = calculate_overall_winner(aggregated)
     
+    # Aggregate by context
+    print("Aggregating results by context availability...")
+    context_split = aggregate_by_context(results)
+    
     # Print report
-    print_comparison_report(aggregated, overall)
+    print_comparison_report(aggregated, overall, context_split)
     
     # Save JSON report
     report_path = PROJECT_ROOT / "reports" / "teacher_comparison_report.json"
     report_path.parent.mkdir(exist_ok=True)
-    save_report_json(results, aggregated, overall, str(report_path))
+    save_report_json(results, aggregated, overall, context_split, str(report_path))
     
     # Summary
     print("\n" + "=" * 80)

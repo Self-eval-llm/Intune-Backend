@@ -53,7 +53,7 @@ CHECKPOINT_PATH = FINETUNED_MODEL_PATH / "checkpoint-1233"  # Best checkpoint
 MAX_NEW_TOKENS = 512
 TEMPERATURE = 0.7
 TOP_P = 0.9
-DEFAULT_BATCH_SIZE = 4  # Default batch size for GPU inference
+DEFAULT_BATCH_SIZE = 3  # Default batch size for GPU inference
 
 # Ollama config (if using Ollama)
 OLLAMA_URL = "http://localhost:11434"

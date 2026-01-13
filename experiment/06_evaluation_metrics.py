@@ -41,8 +41,12 @@ STOPWORDS = {
 }
 
 def normalize(text: str) -> str:
-    """Normalize text: lowercase, strip, collapse whitespace"""
-    return " ".join((text or "").lower().strip().split())
+    """Normalize text: lowercase, strip, remove quotes, collapse whitespace"""
+    text = (text or "").lower().strip()
+    # Remove surrounding quotes and common quote chars
+    text = text.strip('"\'\'\"\u201c\u201d\u2018\u2019')
+    # Collapse whitespace
+    return " ".join(text.split())
 
 def tokenize(text: str) -> List[str]:
     """Extract word tokens from text"""
@@ -497,6 +501,54 @@ def coverage_score(student_output: str, teacher_output: str) -> Dict[str, Any]:
 
 
 # ============================================================================
+# METRIC 4b: CONCISENESS SCORE
+# ============================================================================
+
+def conciseness_score(student_output: str, teacher_output: str) -> Dict[str, Any]:
+    """
+    Penalize verbose outputs. Compare length ratio.
+    Ideal ratio is 0.8-1.2 (similar length to teacher).
+    
+    Returns dict with score and details.
+    """
+    student_words = word_count(student_output)
+    teacher_words = word_count(teacher_output)
+    
+    if teacher_words == 0:
+        return {
+            "conciseness_score": 1.0 if student_words < 50 else 0.5,
+            "length_ratio": 0.0,
+            "student_words": student_words,
+            "teacher_words": teacher_words
+        }
+    
+    ratio = student_words / teacher_words
+    
+    # Score based on ratio:
+    # 0.8 - 1.2 = perfect (1.0)
+    # 0.5 - 2.0 = okay (0.7)
+    # < 0.5 or > 3.0 = poor (0.3)
+    # > 5.0 = very poor (0.1)
+    if 0.8 <= ratio <= 1.2:
+        score = 1.0
+    elif 0.5 <= ratio <= 2.0:
+        score = 0.8
+    elif 0.3 <= ratio <= 3.0:
+        score = 0.6
+    elif 0.2 <= ratio <= 5.0:
+        score = 0.4
+    else:
+        score = 0.2
+    
+    return {
+        "conciseness_score": score,
+        "length_ratio": round(ratio, 2),
+        "student_words": student_words,
+        "teacher_words": teacher_words
+    }
+
+
+# ============================================================================
 # METRIC 5: FAITHFULNESS / HALLUCINATION
 # ============================================================================
 
@@ -734,6 +786,11 @@ def evaluate_single_output(
         "context_grounding_score": 1.0
     }
     
+    # 8. Conciseness (penalize verbose outputs)
+    concise = conciseness_score(student_output, teacher_output) if teacher_output else {
+        "conciseness_score": 1.0, "length_ratio": 1.0
+    }
+    
     # Calculate overall score
     # Positive metrics (higher is better)
     positive_scores = [
@@ -743,6 +800,7 @@ def evaluate_single_output(
         coverage["coverage_score"],
         faith["faithfulness_score"],
         ctx_ground["context_grounding_score"],
+        concise["conciseness_score"],  # Added conciseness
     ]
     
     # Negative metrics (lower is better, so we invert)
@@ -765,6 +823,7 @@ def evaluate_single_output(
         "faithfulness": round(faith["faithfulness_score"], 4),
         "hallucination": round(hallu["hallucination_score"], 4),
         "context_grounding": round(ctx_ground["context_grounding_score"], 4),
+        "conciseness": round(concise["conciseness_score"], 4),
         
         # Overall
         "overall_score": round(overall, 4),
@@ -776,6 +835,7 @@ def evaluate_single_output(
             "context_similarity": round(faith.get("context_similarity", 0), 4),
             "elements_covered": coverage.get("elements_covered", 0),
             "elements_total": coverage.get("elements_total", 0),
+            "length_ratio": concise.get("length_ratio", 1.0),
         }
     }
 
