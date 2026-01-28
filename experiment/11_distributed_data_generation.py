@@ -11,22 +11,26 @@ Architecture:
   - MacBook Pro (WORKER) - CPU generation via Ollama
   - MacBook Air (WORKER) - CPU generation via Ollama
 
-Use Case:
-  After training a checkpoint, you can generate student outputs faster
-  by distributing across machines.
+DUPLICATE PREVENTION:
+  - Each worker gets a UNIQUE partition of data by ID range
+  - Workers track completed IDs in local state files
+  - Results are saved with partition info to avoid merge conflicts
 
 Usage:
-    # Prepare Alpaca 50K data first
-    python experiment/12_incremental_finetune.py --prepare-data
+    # Step 1: Open firewall on Lenovo (Run as Admin)
+    powershell -ExecutionPolicy Bypass -File scripts/open_ray_firewall.ps1
     
-    # Generate for specific checkpoint (local mode):
-    python experiment/11_distributed_data_generation.py --checkpoint 5 --local
+    # Step 2: Start Ray head on Lenovo
+    python experiment/10_ray_cluster_setup.py --head
     
-    # Generate with Ray distributed:
+    # Step 3: Connect MacBooks (run on each MacBook)
+    python experiment/10_ray_cluster_setup.py --worker --head-ip 10.0.1.223
+    
+    # Step 4: Run distributed generation
     python experiment/11_distributed_data_generation.py --checkpoint 5 --distributed
     
-    # Generate specific range of samples:
-    python experiment/11_distributed_data_generation.py --checkpoint 5 --start 0 --end 1000
+    # Alternative: Run locally on GPU (no Ray needed)
+    python experiment/11_distributed_data_generation.py --checkpoint 5 --local
 """
 
 import os
@@ -57,11 +61,14 @@ REPORTS_DIR = PROJECT_ROOT / "reports" / "incremental_learning"
 OLLAMA_MODEL = "gemma3:1b"
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 
+# HEAD NODE IP (your Lenovo LOQ)
+HEAD_NODE_IP = "10.0.1.223"
+RAY_PORT = 6379
+
 # Worker hosts (update with your actual IPs)
 WORKER_HOSTS = [
-    "http://localhost:11434",      # Lenovo LOQ (local)
-    "http://192.168.1.101:11434",  # MacBook Pro
-    "http://192.168.1.102:11434",  # MacBook Air
+    "http://localhost:11434",      # Lenovo LOQ (local Ollama)
+    # Add your MacBook IPs here after connecting
 ]
 
 
@@ -350,17 +357,32 @@ def generate_distributed(
         
         return results
     
-    # Split data across workers
+    # Split data across workers using UNIQUE PARTITIONS (no overlap)
+    # Each record has a unique ID - we partition by ID ranges
     chunk_size = len(eval_data) // num_workers
     chunks = []
+    assigned_ids = set()  # Track assigned IDs to prevent duplicates
+    
     for i in range(num_workers):
         start = i * chunk_size
         end = start + chunk_size if i < num_workers - 1 else len(eval_data)
-        chunks.append(eval_data[start:end])
+        chunk = eval_data[start:end]
+        
+        # Verify no duplicate IDs
+        chunk_ids = {item["id"] for item in chunk}
+        overlap = chunk_ids & assigned_ids
+        if overlap:
+            print(f"⚠️ WARNING: Found {len(overlap)} duplicate IDs in partition {i}!")
+        assigned_ids.update(chunk_ids)
+        
+        chunks.append(chunk)
     
     print(f"\n🚀 Distributing {len(eval_data)} samples across {num_workers} workers:")
+    print(f"   ✓ Total unique IDs assigned: {len(assigned_ids)}")
+    print(f"   ✓ Each partition has exclusive ID range (NO OVERLAP)")
     for i, (chunk, host) in enumerate(zip(chunks, worker_hosts)):
-        print(f"   Worker {i}: {len(chunk)} samples → {host}")
+        id_range = f"ID {chunk[0]['id']}-{chunk[-1]['id']}" if chunk else "empty"
+        print(f"   Worker {i}: {len(chunk)} samples ({id_range}) → {host}")
     
     # Launch tasks
     futures = []

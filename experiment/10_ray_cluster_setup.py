@@ -32,6 +32,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 RAY_PORT = 6379
 RAY_DASHBOARD_PORT = 8265
 
+# HEAD NODE IP (your Lenovo LOQ)
+# Update this if your IP changes
+HEAD_NODE_IP = "10.0.1.223"
+
 
 def get_local_ip():
     """Get local IP address"""
