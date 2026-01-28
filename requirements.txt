@@ -27,6 +27,13 @@ tqdm>=4.66.0
 # JSON handling
 jsonlines>=4.0.0
 
+# Distributed computing (Ray)
+ray[default]>=2.9.0
+psutil>=5.9.0
+
+# Visualization
+matplotlib>=3.7.0
+
 # Optional: For fine-tuning (can be installed separately)
 torch
 transformers
