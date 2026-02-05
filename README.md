@@ -1,363 +1,483 @@
-# INTUNE: Self-Improving LLM Framework
+# INTUNE: Self-Improving LLM via Incremental Knowledge Distillation
 
-An end-to-end framework for training, evaluating, and iteratively improving Large Language Models with automated feedback loops and **incremental learning**.
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.10+-blue.svg" alt="Python">
+  <img src="https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg" alt="PyTorch">
+  <img src="https://img.shields.io/badge/Unsloth-2025.11-orange.svg" alt="Unsloth">
+  <img src="https://img.shields.io/badge/Supabase-PostgreSQL-green.svg" alt="Supabase">
+  <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License">
+</p>
 
-[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-green.svg)](https://fastapi.tiangolo.com/)
-[![Unsloth](https://img.shields.io/badge/Unsloth-2025.11-orange.svg)](https://github.com/unslothai/unsloth)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/Status-Phase%202-success.svg)]()
-
----
-
-## 🎯 Project Phases
-
-| Phase | Description | Status |
-|-------|-------------|--------|
-| **Phase 1** | Teacher Comparison (Alpaca vs OSS-20B) on 4K dataset | ✅ Complete |
-| **Phase 2** | 50K Incremental Learning with 10 Stages | 🔄 In Progress |
+<p align="center">
+  <b>An end-to-end framework for training compact LLMs through iterative knowledge distillation with automated evaluation and incremental learning.</b>
+</p>
 
 ---
 
-## Team Members
+## 📋 Table of Contents
 
-| Name                      | Roll Number |
-|---------------------------|-------------|
-| Radhakrishna Bharuka      | 24BDS063    |
-| Abhang Pawar              | 24BDS054    |
-| Nilesh Dwivedi            | 24BDS048    |
-| Rushikesh Masalkar        | 24BDS040    |
-
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Phase 2: Incremental Learning](#phase-2-incremental-learning)
-- [Google Colab Setup](#google-colab-setup)
-- [Demo Video](#demo-video)
-- [Features](#features)
+- [Abstract](#abstract)
+- [Key Contributions](#key-contributions)
+- [Research Phases](#research-phases)
 - [System Architecture](#system-architecture)
+- [Methodology](#methodology)
+  - [Phase 1: Teacher Selection](#phase-1-teacher-selection-4k-dataset)
+  - [Phase 2: Incremental Learning](#phase-2-incremental-learning-50k-dataset)
+- [Evaluation Framework](#evaluation-framework)
+- [Experimental Results](#experimental-results)
+- [Technical Implementation](#technical-implementation)
 - [Repository Structure](#repository-structure)
-- [Installation Process](#installation-process)
-- [Execution Guide](#execution-guide)
-- [Evaluation Metrics](#evaluation-metrics)
-- [API Documentation](#api-documentation)
-- [Technology Stack](#technology-stack)
-- [Documentation](#documentation)
-- [License](#license)
+- [Usage Guide](#usage-guide)
+- [Team](#team)
+- [Citation](#citation)
 
 ---
 
-## Overview
+## Abstract
 
-This framework implements a self-improving Large Language Model system that:
+Large Language Models (LLMs) have demonstrated remarkable capabilities, but their deployment remains challenging due to computational requirements. **INTUNE** addresses this through a two-phase knowledge distillation framework:
 
-- Automatically collects training data from user interactions
-- Evaluates model quality using 8 comprehensive metrics
-- Fine-tunes models using efficient LoRA (Low-Rank Adaptation) adapters
-- Measures improvements quantitatively with before/after comparisons
-- **NEW: Implements 10-stage incremental learning on 50K dataset**
-- Operates continuously with background workers
-- Scales efficiently on consumer GPUs (8GB VRAM minimum)
+1. **Teacher Selection**: Systematic comparison of teacher models (Alpaca-7B vs GPT-OSS-20B) using 7 model-agnostic evaluation metrics on 4,000 samples
+2. **Incremental Learning**: Progressive knowledge transfer from the selected teacher to a compact student model (Gemma 3:1B) through 10 stages on 50,000 samples
+
+Our framework achieves **57.2% win rate** for the Alpaca teacher over GPT-OSS-20B, with **40.8% lower hallucination**, demonstrating that smaller, well-tuned teachers can outperform larger models for knowledge distillation tasks.
 
 ---
 
-## Phase 2: Incremental Learning
+## Key Contributions
 
-### 📊 Experiment Overview
-
-Phase 2 implements **incremental learning** where the student model (Gemma 3:1B) learns progressively from the teacher (Alpaca-7B) through 10 stages.
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                 INCREMENTAL LEARNING PIPELINE                   │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  50K Dataset (Supabase: modelcomp_50k)                         │
-│  ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐ │
-│  │ 5K  │ 5K  │ 5K  │ 5K  │ 5K  │ 5K  │ 5K  │ 5K  │ 5K  │ 5K  │ │
-│  │ S1  │ S2  │ S3  │ S4  │ S5  │ S6  │ S7  │ S8  │ S9  │ S10 │ │
-│  └─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘ │
-│                                                                 │
-│  Stage 1: Train on 5K   → Generate → Eval → student_output_ckpt1│
-│  Stage 2: Train on 10K  → Generate → Eval → student_output_ckpt2│
-│  Stage 3: Train on 15K  → Generate → Eval → student_output_ckpt3│
-│  ...                                                            │
-│  Stage 10: Train on 50K → Generate → Eval → student_output_ckpt10│
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 📁 Supabase Table: `modelcomp_50k`
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | INT | Primary key |
-| `input` | TEXT | Instruction/prompt |
-| `context` | TEXT | Optional context |
-| `sevenb` | TEXT | Teacher output (Alpaca-7B) |
-| `student_output` | TEXT | Base student output (before finetuning) |
-| `student_output_ckpt1-10` | TEXT | Output after each stage |
-| `score_ckpt1-10` | DECIMAL | Similarity score per stage |
-| `latency_ckpt1-10` | DECIMAL | Generation latency per stage |
-
-### 🚀 Phase 2 Execution Steps
-
-```bash
-# Step 1: Add checkpoint columns (run in Supabase SQL Editor)
-# File: sql/04_schema_50k_checkpoints.sql
-
-# Step 2: Generate base student outputs (before finetuning)
-python experiment/11_gen_base_student.py
-
-# Step 3: Run incremental learning stages 1-10
-python experiment/12_train_incremental.py --stage 1
-python experiment/12_train_incremental.py --stage 2
-# ... continue for stages 3-10
-```
+| Contribution | Description |
+|-------------|-------------|
+| **Teacher Selection Framework** | Novel methodology to systematically compare teacher models using 7 model-agnostic metrics without LLM-as-judge bias |
+| **Hallucination-Aware Evaluation** | Demonstrated that hallucination rate is a critical differentiator—Alpaca achieves 0.1814 vs OSS's 0.3063 |
+| **Incremental Learning Pipeline** | 10-stage progressive training (5K→50K) enabling fine-grained analysis of knowledge transfer dynamics |
+| **Comprehensive Metric Suite** | 7 automated metrics covering structure, task success, instruction following, coverage, faithfulness, hallucination, and context grounding |
+| **Reproducible Framework** | End-to-end pipeline with Supabase persistence, Colab compatibility, and detailed logging |
 
 ---
 
-## Google Colab Setup
+## Research Phases
 
-### 🌐 Why Use Colab?
-
-| Local RTX 4060 | Colab T4 (Free) |
-|----------------|-----------------|
-| ~12-16 sec/record | ~3-5 sec/record |
-| 7 days for 50K | 2 days for 50K |
-| Your electricity | Free GPU hours |
-
-### 📓 Available Notebooks
-
-| Notebook | Purpose | Location |
-|----------|---------|----------|
-| `base_student_colab.ipynb` | Generate base student outputs for 50K | `colab/` |
-| `finetune_incremental_colab.ipynb` | Finetune + generate per stage | `colab/` |
-
-### 🔧 Step-by-Step Colab Instructions
-
-#### 1️⃣ Upload Notebook to Colab
-
-1. Go to [colab.research.google.com](https://colab.research.google.com)
-2. Click **File → Upload notebook**
-3. Select `colab/base_student_colab.ipynb` or `colab/finetune_incremental_colab.ipynb`
-
-#### 2️⃣ Enable T4 GPU
-
-1. Click **Runtime → Change runtime type**
-2. Select **T4 GPU** from Hardware accelerator dropdown
-3. Click **Save**
-
-#### 3️⃣ Get Supabase Credentials
-
-From your local `.env` file, copy:
 ```
-SUPABASE_URL=https://xxxxx.supabase.co
-SUPABASE_KEY=your_service_role_key
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           INTUNE RESEARCH PIPELINE                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                    PHASE 1: TEACHER SELECTION                        │   │
+│  │                         (4K Dataset)                                 │   │
+│  │                                                                      │   │
+│  │   Stanford Alpaca ──→ Gemma 3:1B ──→ tuned_alpaca                   │   │
+│  │   GPT-OSS-20B     ──→ Gemma 3:1B ──→ tuned_oss                      │   │
+│  │                            ↓                                         │   │
+│  │              7-Metric Evaluation Matrix                              │   │
+│  │                            ↓                                         │   │
+│  │              🏆 Winner: Alpaca (57.2% win rate)                      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    ↓                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                   PHASE 2: INCREMENTAL LEARNING                      │   │
+│  │                         (50K Dataset)                                │   │
+│  │                                                                      │   │
+│  │   Stage 1:  5K samples  ──→ Finetune ──→ Evaluate ──→ ckpt1        │   │
+│  │   Stage 2: 10K samples  ──→ Finetune ──→ Evaluate ──→ ckpt2        │   │
+│  │   Stage 3: 15K samples  ──→ Finetune ──→ Evaluate ──→ ckpt3        │   │
+│  │     ...                                                              │   │
+│  │   Stage 10: 50K samples ──→ Finetune ──→ Evaluate ──→ ckpt10       │   │
+│  │                            ↓                                         │   │
+│  │              Learning Curve Analysis                                 │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 4️⃣ Run Base Student Notebook
-
-1. **Cell 1**: Install dependencies (~2 min)
-2. **Cell 2**: Paste your Supabase credentials
-3. **Cell 3**: Load model (~1-2 min)
-4. **Cell 4**: Check remaining records
-5. **Cell 5-6**: Setup and test generation
-6. **Cell 7**: **Start main loop** (runs until complete or timeout)
-7. **Cell 8**: Check final progress
-
-#### 5️⃣ Run Finetuning Notebook
-
-1. **Cell 2**: Set `STAGE = 1` and Supabase credentials
-2. **Cells 3-4**: Load model with LoRA adapters
-3. **Cells 5-6**: Fetch and format training data
-4. **Cell 7**: Finetune (~15-30 min per stage)
-5. **Cells 9-10**: Generate outputs for all 50K
-6. **Cell 11**: Evaluate and compare with base
-7. **Cell 12**: See summary and next steps
-
-#### 6️⃣ Continue Next Stage
-
-1. Change `STAGE = 2` in Cell 2
-2. Click **Runtime → Restart runtime**
-3. Run all cells again
-
-### ⏱️ Time Estimates
-
-| Task | Time on T4 |
-|------|------------|
-| Base Student (50K) | ~50-60 hours (4-5 sessions) |
-| Finetune (5K) | ~15 min |
-| Finetune (50K) | ~2-3 hours |
-| Generate (50K) | ~4-6 hours |
-| **Total 10 Stages** | ~60-80 hours |
-
-### 💡 Tips for Colab Free Tier
-
-- Free tier gives ~12 hours per session
-- Sessions timeout after ~90 min of inactivity
-- Progress saves to Supabase after EACH record (safe to stop)
-- Can run overnight, but keep browser tab open
-- If disconnected, just restart and it continues from where it left off
-
----
-
-## Demo Video
-
-**2-Minute Working Demo**
-
-[![Demo Video Preview](docs/intune_landingpage.png)](https://github.com/Self-eval-llm/Intune-Backend/blob/main/docs/demo_video.mp4)
-
-**[Click here to watch the full demo video](https://github.com/Self-eval-llm/Intune-Backend/blob/main/docs/demo_video.mp4)**
-
-The demo video demonstrates:
-- User interactions through the chat interface
-- Real-time response generation from the model
-- Background evaluation workers computing metrics
-- Fine-tuning process triggering automatically
-- Before and after comparison of model improvements
-
----
-
-## Features
-
-### Automated Training Pipeline
-- Continuous data collection from user interactions
-- Automatic dataset preparation and validation
-- Threshold-based fine-tuning trigger (configurable)
-
-### Comprehensive Evaluation System
-- 8 distinct quality metrics for thorough assessment
-- Before and after comparison reports
-- Real-time metric computation
-
-### Efficient Fine-tuning
-- LoRA-based fine-tuning for memory efficiency
-- Runs on consumer GPUs with 8GB+ VRAM
-- Checkpoint saving every 100 steps
-
-### Background Workers
-- Asynchronous metric computation
-- Automated fine-tuning workflow
-- Continuous monitoring and processing
+| Phase | Dataset Size | Purpose | Status |
+|-------|-------------|---------|--------|
+| **Phase 1** | 4,000 samples | Teacher model comparison (Alpaca vs OSS-20B) | ✅ Complete |
+| **Phase 2** | 50,000 samples | 10-stage incremental knowledge distillation | 🔄 In Progress |
 
 ---
 
 ## System Architecture
 
-### High-Level Component Diagram
+### Models
+
+| Component | Model | Parameters | Quantization |
+|-----------|-------|------------|--------------|
+| **Student** | Gemma 3:1B | 1 Billion | 4-bit (bnb) |
+| **Teacher 1** | Stanford Alpaca | 7 Billion | 4-bit (bnb) |
+| **Teacher 2** | GPT-OSS-20B | 20 Billion | 4-bit (bnb) |
+
+### Fine-tuning Configuration
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| **Method** | LoRA (Low-Rank Adaptation) | Memory-efficient fine-tuning |
+| **Rank (r)** | 16 | Balance between capacity and efficiency |
+| **Alpha** | 16 | Standard scaling factor |
+| **Dropout** | 0 | Limited data benefits from no regularization |
+| **Learning Rate** | 2e-4 | Optimal for LoRA fine-tuning |
+| **Batch Size** | 4 | Consumer GPU compatible (8GB VRAM) |
+| **Max Seq Length** | 2048 | Full context utilization |
+| **Epochs** | 3 | Prevent overfitting on limited data |
+
+### Infrastructure
+
+| Component | Technology | Purpose |
+|-----------|------------|---------|
+| **Database** | Supabase (PostgreSQL) | Persistent storage for 50K samples + results |
+| **Training** | Google Colab T4 / Local RTX 4060 | GPU compute |
+| **ML Framework** | Unsloth + HuggingFace Transformers | Efficient fine-tuning |
+| **Optimization** | 4-bit Quantization (bitsandbytes) | Memory reduction |
+
+---
+
+## Methodology
+
+### Phase 1: Teacher Selection (4K Dataset)
+
+#### Objective
+Determine which teacher model produces better fine-tuned students by comparing two knowledge distillation approaches:
+- **Approach A**: Gemma 3:1B fine-tuned on Alpaca-7B outputs
+- **Approach B**: Gemma 3:1B fine-tuned on GPT-OSS-20B outputs
+
+#### Pipeline
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                   SELF-IMPROVING LLM FRAMEWORK                  │
-│                                                                 │
-│  ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
-│  │   FRONTEND   │◄───────►│   BACKEND    │◄───────►│   DATABASE   │
-│  │  (React/Vue) │  REST   │   (FastAPI)  │  SQL    │  (Supabase)  │
-│  │              │   API   │              │         │              │
-│  │  Port: 5173  │         │  Port: 8000  │         │    Cloud     │
-│  └──────────────┘         └──────────────┘         └──────────────┘
-│                                   │                                    
-│                                   │                                    
-│                          ┌────────┴────────┐                          
-│                          │                 │                          
-│                    ┌─────▼─────┐    ┌─────▼─────┐                   
-│                    │  Worker 1  │    │  Worker 2  │                   
-│                    │ eval_first │    │eval_finetune│                  
-│                    │ (Metrics)  │    │ (Training) │                   
-│                    └────────────┘    └────────────┘                   
-│                          │                 │                          
-│                          └────────┬────────┘                          
-│                                   │                                    
-│                          ┌────────▼────────┐                          
-│                          │  OLLAMA SERVER  │                          
-│                          │  Port: 11434    │                          
-│                          │                 │                          
-│                          │  - Gemma 1B     │                          
-│                          │  - GPT-OSS 20B  │                          
-│                          │  - Fine-tuned   │                          
-│                          └─────────────────┘                          
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                    PHASE 1: TEACHER SELECTION                        │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Step 1: Data Preparation                                            │
+│  ────────────────────────                                            │
+│  • Download Stanford Alpaca dataset (52K instructions)               │
+│  • Sample 4,000 diverse instructions                                 │
+│  • Store in Supabase table: modelComp                                │
+│                                                                      │
+│  Step 2: Teacher Output Generation                                   │
+│  ─────────────────────────────────                                   │
+│  • Generate Alpaca-7B outputs for all 4K instructions                │
+│  • Generate GPT-OSS-20B outputs for all 4K instructions              │
+│  • Store as 'sevenb' and 'twentyb' columns                           │
+│                                                                      │
+│  Step 3: Student Fine-tuning                                         │
+│  ──────────────────────────                                          │
+│  • Fine-tune Gemma 3:1B on Alpaca outputs → tuned_alpaca            │
+│  • Fine-tune Gemma 3:1B on OSS-20B outputs → tuned_oss              │
+│  • LoRA adapters saved separately                                    │
+│                                                                      │
+│  Step 4: Evaluation                                                  │
+│  ─────────────────                                                   │
+│  • Generate outputs from both tuned models                           │
+│  • Compute 7 evaluation metrics                                      │
+│  • Statistical comparison (chi-square test)                          │
+│                                                                      │
+│  Step 5: Teacher Selection                                           │
+│  ────────────────────────                                            │
+│  • Winner: Alpaca (57.2% win rate, p < 0.0001)                       │
+│  • Selected for Phase 2 training                                     │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-### Data Flow Diagram
+#### Task Categories
+
+| Category | Count | Description | Priority Metrics |
+|----------|-------|-------------|------------------|
+| **general_qa** | 1,432 | Open-ended questions | All metrics equally |
+| **classification_analysis** | 962 | Categorization tasks | Coverage, Instruction Following |
+| **creative_generative** | 543 | Creative writing | Task Success, Instruction Following |
+| **language_editing** | 434 | Translation, editing | Faithfulness, Coverage |
+| **math_logic** | 338 | Mathematical reasoning | Task Success, Coverage |
+| **technical_code** | 286 | Code generation | Structured Correctness, Task Success |
+| **explanatory** | 1 | Explanation tasks | All metrics |
+
+---
+
+### Phase 2: Incremental Learning (50K Dataset)
+
+#### Objective
+Train the student model progressively on increasingly larger subsets (5K→10K→...→50K) to:
+1. Measure learning curve dynamics
+2. Identify optimal training data size
+3. Analyze convergence behavior
+
+#### Pipeline
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    SELF-IMPROVEMENT LOOP                        │
-└─────────────────────────────────────────────────────────────────┘
-
-Step 1: USER INTERACTION
-  ┌─────────────────┐
-  │ User submits    │
-  │ a question      │
-  └────────┬────────┘
-           │
-           ▼
-Step 2: RESPONSE GENERATION
-  ┌─────────────────┐
-  │ Gemma 1B Model  │
-  │ generates answer│
-  └────────┬────────┘
-           │
-           ▼
-Step 3: DATABASE STORAGE
-  ┌─────────────────────┐
-  │ Save to Supabase    │
-  │ status: 'created'   │
-  └────────┬────────────┘
-           │
-           ▼
-Step 4: FIRST EVALUATION
-  ┌─────────────────────────────────┐
-  │ Compute 8 metrics:              │
-  │ - Answer Relevancy              │
-  │ - Contextual Precision          │
-  │ - Faithfulness                  │
-  │ - Toxicity                      │
-  │ - Overall Score                 │
-  │ - And 3 more                    │
-  │ status: 'done'                  │
-  └────────┬────────────────────────┘
-           │
-           ▼
-Step 5: DATA ACCUMULATION
-  ┌─────────────────────┐
-  │ Collect N records   │
-  │ (default: 5000)     │
-  └────────┬────────────┘
-           │
-           ▼
-Step 6: FINE-TUNING
-  ┌─────────────────────────────────┐
-  │ Trigger at threshold            │
-  │ - Prepare training data         │
-  │ - Apply LoRA adapters           │
-  │ - Train for 3 epochs            │
-  │ - Save improved model           │
-  └────────┬────────────────────────┘
-           │
-           ▼
-Step 7: FINAL EVALUATION
-  ┌─────────────────────────────────┐
-  │ Re-evaluate with fine-tuned     │
-  │ model and compare results:      │
-  │                                 │
-  │ Base Model → Fine-tuned Model   │
-  │ Score: 0.65 → Score: 0.78       │
-  │ Improvement: +20%               │
-  └────────┬────────────────────────┘
-           │
-           ▼
-Step 8: DEPLOY AND REPEAT
-  ┌─────────────────────┐
-  │ Use improved model  │
-  │ for new interactions│
-  │ Loop back to Step 1 │
-  └─────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    PHASE 2: INCREMENTAL LEARNING                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Supabase Table: modelcomp_50k                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  id | input | context | sevenb | student_output | ckpt1..10 cols   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  Stage Execution (for stage n = 1 to 10):                                   │
+│  ────────────────────────────────────────                                   │
+│                                                                             │
+│  1. FETCH cumulative training data (n × 5,000 samples)                      │
+│     └── Stage 1: 5K, Stage 2: 10K, ..., Stage 10: 50K                      │
+│                                                                             │
+│  2. FINETUNE Gemma 3:1B with LoRA                                           │
+│     └── Training time: ~15-30 min per 5K on T4 GPU                          │
+│                                                                             │
+│  3. GENERATE outputs for all 50K samples                                    │
+│     └── Store in: student_output_ckpt{n}                                    │
+│                                                                             │
+│  4. EVALUATE using 7-metric framework                                       │
+│     └── Store in: score_ckpt{n}                                            │
+│                                                                             │
+│  5. COMPARE with previous checkpoint                                        │
+│     └── Log improvement/degradation metrics                                 │
+│                                                                             │
+│  6. SAVE checkpoint and proceed to next stage                               │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+#### Data Schema (modelcomp_50k)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INT | Primary key (1-50000) |
+| `checkpoint` | INT | Which 5K batch (1-10) |
+| `input` | TEXT | Instruction/prompt |
+| `context` | TEXT | Optional context |
+| `sevenb` | TEXT | Teacher output (Alpaca-7B) |
+| `student_output` | TEXT | Base student output (pre-finetuning) |
+| `generation_latency` | DECIMAL | Base generation time (seconds) |
+| `student_output_ckpt1` | TEXT | Output after Stage 1 training |
+| `score_ckpt1` | DECIMAL | Similarity score after Stage 1 |
+| `latency_ckpt1` | DECIMAL | Generation latency after Stage 1 |
+| ... | ... | Columns repeat for ckpt2-10 |
+
+---
+
+## Evaluation Framework
+
+### 7-Metric Evaluation Suite
+
+All metrics are **model-agnostic** and **do not require an LLM judge**, eliminating bias from using another LLM for evaluation.
+
+| # | Metric | Range | Goal | Description |
+|---|--------|-------|------|-------------|
+| 1 | **Structured Correctness** | 0-1 | ↑ Higher | Validity of structured outputs (JSON, code, lists) |
+| 2 | **Task Success** | 0-1 | ↑ Higher | Heuristic-based task completion measure |
+| 3 | **Instruction Following** | 0-1 | ↑ Higher | Adherence to length, format, language constraints |
+| 4 | **Coverage** | 0-1 | ↑ Higher | Completeness vs reference output |
+| 5 | **Faithfulness** | 0-1 | ↑ Higher | Agreement with teacher/context |
+| 6 | **Hallucination** | 0-1 | ↓ Lower | Ratio of ungrounded content |
+| 7 | **Context Grounding** | 0-1 | ↑ Higher | Utilization of provided context |
+
+### Metric Definitions
+
+#### 1. Structured Correctness
+Measures validity of structured outputs:
+- **Code tasks**: Python AST parsing (1.0 = valid syntax)
+- **JSON tasks**: Parseability check
+- **List/Table tasks**: Format validation
+
+```python
+# Scoring Logic
+if task == "technical_code":
+    score = 1.0 if ast.parse(output) else 0.5
+elif expects_json:
+    score = 1.0 if json.loads(output) else 0.3
+else:
+    score = 0.5 + structure_bonuses
+```
+
+#### 2. Task Success Score
+Heuristic-based completion measure:
+- Refusal detection ("I cannot", "As an AI")
+- Minimum length check (>5 words)
+- Instruction relevance (cosine similarity)
+- Teacher similarity (semantic overlap)
+
+```python
+if empty or refusal: return 0.1
+if too_short: return 0.2
+return 0.5 + 0.3 × instruction_relevance + 0.2 × teacher_similarity
+```
+
+#### 3. Instruction Following
+Rubric-based scoring (0-2 per component):
+
+| Component | Score 2 | Score 1 | Score 0 |
+|-----------|---------|---------|---------|
+| **Length** | Within limit | 10-50% over | >50% over |
+| **Format** | Required format present | - | Missing |
+| **Refusal** | No refusal | - | Contains refusal |
+| **Language** | Correct language | - | Wrong language |
+
+#### 4. Coverage Score
+Measures completeness against reference:
+
+$$\text{Coverage} = \frac{|\text{Teacher\_terms} \cap \text{Student\_terms}|}{|\text{Teacher\_terms}|}$$
+
+#### 5. Faithfulness Score
+Weighted combination of teacher and context agreement:
+
+$$\text{Faithfulness} = 0.6 \times \cos(\text{Student}, \text{Teacher}) + 0.4 \times \cos(\text{Student}, \text{Context})$$
+
+#### 6. Hallucination Score
+Ratio of ungrounded content (lower is better):
+
+$$\text{Hallucination} = 1 - \frac{|\text{Context\_terms} \cap \text{Output\_terms}|}{|\text{Output\_terms}|}$$
+
+#### 7. Context Grounding Ratio
+Measures context utilization:
+
+$$\text{Context\_Grounding} = \frac{|\text{Context\_terms} \cap \text{Output\_terms}|}{|\text{Context\_terms}|}$$
+
+### Overall Score Computation
+
+```python
+positive = [structured_correctness, task_success, instruction_following, 
+            coverage, faithfulness, context_grounding]
+negative = [hallucination]
+
+overall = mean(positive) × (1 - mean(negative))
+```
+
+---
+
+## Experimental Results
+
+### Phase 1: Teacher Comparison Results
+
+#### Overall Statistics
+
+| Metric | Value |
+|--------|-------|
+| **Total Records** | 3,996 |
+| **Alpaca Wins** | 2,286 (57.2%) |
+| **OSS-20B Wins** | 1,502 (37.6%) |
+| **Ties** | 208 (5.2%) |
+| **Winner** | **Alpaca** |
+| **Statistical Significance** | p < 0.0001 (chi-square) |
+
+#### Metric-by-Metric Comparison
+
+| Metric | Alpaca | OSS-20B | Δ | Winner |
+|--------|--------|---------|---|--------|
+| **Structured Correctness** | 0.5182 | 0.5860 | -0.0678 | OSS |
+| **Task Success** | 0.5814 | 0.6247 | -0.0433 | OSS |
+| **Instruction Following** | 0.9902 | 0.9943 | -0.0041 | Tie |
+| **Coverage** | 0.2172 | 0.2289 | -0.0117 | OSS |
+| **Faithfulness** | 0.3603 | 0.2678 | **+0.0925** | **Alpaca** |
+| **Hallucination** ↓ | **0.1814** | 0.3063 | **-0.1249** | **Alpaca** |
+| **Context Grounding** | 0.8572 | 0.8525 | +0.0047 | Alpaca |
+| **Overall Score** | **0.5080** | 0.4246 | **+0.0834** | **Alpaca** |
+
+#### Key Finding: Hallucination Control
+
+```
+🏆 ALPACA DOMINATES HALLUCINATION CONTROL
+
+   Alpaca Hallucination: 0.1814 (LOWER = BETTER)
+   OSS Hallucination:    0.3063
+   Advantage:            40.8% fewer hallucinations
+   
+   ✓ Critical for reliability and trustworthiness
+   ✓ Reduces false information in generated content
+   ✓ Justifies selection despite lower raw metrics
+```
+
+#### Category-wise Performance
+
+| Category | Records | Alpaca Wins | OSS Wins | Alpaca Score | OSS Score |
+|----------|---------|-------------|----------|--------------|-----------|
+| **general_qa** | 1,432 | 865 | 501 | 0.5080 | 0.4246 |
+| **language_editing** | 434 | 316 | 102 | 0.4583 | 0.2471 |
+| **math_logic** | 338 | 215 | 104 | 0.4696 | 0.3484 |
+| **classification_analysis** | 962 | 470 | 414 | 0.3990 | 0.3353 |
+| **creative_generative** | 543 | 285 | 243 | 0.4879 | 0.4534 |
+| **technical_code** | 286 | 134 | 138 | 0.4576 | 0.4315 |
+
+#### Context Analysis
+
+| Condition | Records | Alpaca Wins | OSS Wins | Alpaca Score | OSS Score |
+|-----------|---------|-------------|----------|--------------|-----------|
+| **With Context** | 1,729 | 1,206 (69.7%) | 321 | 0.2705 | 0.0686 |
+| **Without Context** | 2,267 | 1,080 (47.6%) | 1,181 | 0.6163 | 0.6205 |
+
+**Insight**: Alpaca significantly outperforms on context-aware tasks (69.7% win rate), critical for practical applications.
+
+---
+
+### Phase 2: Incremental Learning Results (Preliminary)
+
+#### Checkpoint 1 (5K Training Data)
+
+| Metric | Value |
+|--------|-------|
+| **Train Loss** | 1.0814 |
+| **Eval Loss** | 0.9278 |
+| **Training Time** | 670.22 seconds (~11 min) |
+| **Overall Score** | 0.4883 |
+
+#### Checkpoint 2 (10K Training Data)
+
+| Metric | Value | Δ from Ckpt 1 |
+|--------|-------|---------------|
+| **Train Loss** | 1.0757 | -0.0057 |
+| **Eval Loss** | 1.0042 | +0.0764 |
+| **Training Time** | 3,169.85 seconds (~53 min) | - |
+| **Overall Score** | 0.4904 | **+0.0021** |
+
+#### Metric Evolution (Ckpt 1 → Ckpt 2)
+
+| Metric | Checkpoint 1 | Checkpoint 2 | Change |
+|--------|--------------|--------------|--------|
+| Structured Correctness | 0.5211 | 0.5189 | -0.0022 |
+| Task Success | 0.6072 | 0.6105 | +0.0033 |
+| Instruction Following | 0.9907 | 0.9905 | -0.0002 |
+| Coverage | 0.2922 | 0.2951 | +0.0029 |
+| Faithfulness | 0.4092 | 0.4151 | +0.0059 |
+| Hallucination ↓ | 0.2587 | 0.2573 | **-0.0014** |
+| Context Grounding | 0.8226 | 0.8273 | +0.0047 |
+| **Overall Score** | 0.4883 | **0.4904** | **+0.0021** |
+
+---
+
+## Technical Implementation
+
+### Dependencies
+
+```
+# Core ML
+torch>=2.0.0
+transformers>=4.40.0
+unsloth>=2025.11
+trl>=0.7.0
+bitsandbytes>=0.41.0
+
+# Evaluation
+scikit-learn>=1.3.0
+rouge-score>=0.1.2
+nltk>=3.8.0
+sentence-transformers>=2.2.0
+
+# Infrastructure
+supabase>=2.0.0
+python-dotenv>=1.0.0
+tqdm>=4.65.0
+
+# Data Processing
+pandas>=2.0.0
+datasets>=2.14.0
+```
+
+### Hardware Requirements
+
+| Configuration | VRAM | Speed | Recommended For |
+|--------------|------|-------|-----------------|
+| **RTX 4060 8GB** | 8 GB | ~12-16 sec/record | Development/Testing |
+| **Colab T4** | 16 GB | ~3-5 sec/record | Production Training |
+| **RTX 4090** | 24 GB | ~1-2 sec/record | Fast Iteration |
 
 ---
 
@@ -365,675 +485,182 @@ Step 8: DEPLOY AND REPEAT
 
 ```
 Intune_Backend/
+├── README.md                           # This file
+├── requirements.txt                    # Python dependencies
+├── .env                                # Supabase credentials (not tracked)
 │
-├── .env                          # Environment variables (Supabase credentials)
-├── .gitignore                    # Git ignore rules
-├── requirements.txt              # Core dependencies
-├── requirements_finetune.txt     # Fine-tuning dependencies (Unsloth)
-├── README.md                     # This file
+├── experiment/                         # Core experiment scripts
+│   ├── 01_data_download_alpaca.py     # Download Stanford Alpaca dataset
+│   ├── 02_data_prepare_4k.py          # Prepare 4K sample dataset
+│   ├── 03_gen_base_gemma.py           # Generate base Gemma outputs
+│   ├── 04a_train_finetune_alpaca.py   # Finetune with Alpaca teacher
+│   ├── 04b_gen_teacher_oss20b.py      # Generate OSS-20B outputs
+│   ├── 05_data_label.py               # Label dataset by task type
+│   ├── 06_eval_metrics.py             # 7-metric evaluation module
+│   ├── 06a_gen_tuned_alpaca.py        # Generate tuned Alpaca outputs
+│   ├── 07_eval_compare_teachers.py    # Compare teachers → select winner
+│   ├── 08_gen_context.py              # Generate context embeddings
+│   ├── 09_report_analytical.py        # Generate analytical reports
+│   ├── 10_data_upload_50k.py          # Upload 50K dataset to Supabase
+│   ├── 11_gen_base_student.py         # Generate base student outputs (50K)
+│   ├── 12_train_incremental.py        # 10-stage incremental training
+│   ├── EVALUATION_METRICS.md          # Detailed metric documentation
+│   └── README.md                       # Experiment pipeline docs
 │
-├── app/                          # APPLICATION LAYER
-│   ├── app.py                    # Main FastAPI server (Port 8000)
-│   ├── eval_first.py             # Worker 1: Base metrics evaluation
-│   ├── eval_finetune.py          # Worker 2: Fine-tuning and final evaluation
-│   └── README.md                 # API documentation
+├── colab/                              # Google Colab notebooks
+│   ├── base_student_colab.ipynb       # Generate base student (50K)
+│   └── finetune_incremental_colab.ipynb # Incremental finetuning
 │
-├── colab/                        # GOOGLE COLAB NOTEBOOKS
-│   ├── base_student_colab.ipynb  # Generate base student outputs (50K)
-│   └── finetune_incremental_colab.ipynb  # Incremental finetuning stages
+├── sql/                                # Database schemas
+│   ├── 01_schema_setup.sql            # Initial Supabase setup
+│   ├── 02_schema_eval_matrix.sql      # Evaluation columns
+│   ├── 03_schema_incremental_tables.sql # Incremental learning tables
+│   └── 04_schema_50k_checkpoints.sql  # 50K checkpoint columns
 │
-├── experiment/                   # EXPERIMENT SCRIPTS (Numbered)
-│   ├── 01_data_download_alpaca.py      # Download Alpaca dataset
-│   ├── 02_data_prepare_4k.py           # Prepare 4K subset
-│   ├── 03_gen_base_gemma.py            # Generate base Gemma outputs
-│   ├── 04a_train_finetune_alpaca.py    # Finetune with Alpaca teacher
-│   ├── 04b_gen_teacher_oss20b.py       # Generate OSS-20B outputs
-│   ├── 05_data_label.py                # Label dataset
-│   ├── 06_eval_metrics.py              # Compute evaluation metrics
-│   ├── 06a_gen_tuned_alpaca.py         # Generate tuned model outputs
-│   ├── 07_eval_compare_teachers.py     # Compare Alpaca vs OSS-20B
-│   ├── 08_gen_context.py               # Generate context
-│   ├── 09_report_analytical.py         # Generate analytical report
-│   ├── 10_data_upload_50k.py           # Upload 50K to Supabase
-│   ├── 11_gen_base_student.py          # Generate base student outputs
-│   ├── 12_train_incremental.py         # Incremental learning stages
-│   ├── EVALUATION_METRICS.md           # Metrics documentation
-│   └── README.md                       # Experiment documentation
+├── scripts/                            # Utility scripts
+│   ├── model_convert_gguf.py          # Convert to GGUF format
+│   ├── model_create_ollama.py         # Create Ollama model
+│   ├── model_merge_lora.py            # Merge LoRA adapters
+│   └── report_merge_results.py        # Merge result files
 │
-├── src/                          # SOURCE CODE LAYER
-│   ├── database/                 # Database abstraction
-│   │   └── supabase_client.py    # Supabase connection and utilities
-│   ├── data_generation/          # Data pipeline
-│   │   ├── teacher.py            # Generate training examples
-│   │   ├── student.py            # Generate base outputs
-│   │   └── prepare_data.py       # Format for training
-│   ├── training/                 # Model fine-tuning
-│   │   └── finetune.py           # LoRA-based training
-│   ├── evaluation/               # Quality assessment
-│   │   ├── update_metrics.py     # Compute base metrics
-│   │   ├── evaluate_finetuned.py # Compare base vs tuned
-│   │   ├── evaluate_finetuned_batch.py  # Batch evaluation
-│   │   ├── evaluate_ollama.py    # Test deployed models
-│   │   └── generate_report.py    # Create comparison reports
-│   └── metrics/                  # Evaluation engine
-│       └── llm_eval.py           # 8 metrics implementation
+├── reports/                            # Generated reports
+│   ├── teacher_comparison_report.json # Phase 1 comparison data
+│   ├── teacher_comparison_analytical_report.txt # Phase 1 analysis
+│   └── incremental_learning/          # Phase 2 results
+│       ├── incremental_learning_results.json
+│       └── detailed_evals/            # Per-checkpoint evaluations
 │
-├── scripts/                      # UTILITY SCRIPTS
-│   ├── model_convert_gguf.py     # Convert model to GGUF format
-│   ├── model_create_ollama.py    # Create Ollama model
-│   ├── model_merge_lora.py       # Merge LoRA adapters
-│   └── report_merge_results.py   # Merge evaluation results
+├── models/                             # Saved models (git-ignored)
+│   ├── gemma-alpaca-teacher/          # Alpaca-tuned LoRA
+│   ├── gemma-finetuned/               # Current best model
+│   └── gemma-finetuned.gguf           # GGUF export
 │
-├── sql/                          # DATABASE SCHEMAS
-│   ├── 01_schema_setup.sql       # Initial table setup
-│   ├── 02_schema_eval_matrix.sql # Evaluation matrix columns
-│   ├── 03_schema_incremental_tables.sql  # Incremental learning tables
-│   └── 04_schema_50k_checkpoints.sql     # 50K checkpoint columns
+├── data/                               # Data files
+│   └── experiment/                     # Experiment datasets
+│       ├── alpaca_50k_prepared.json   # Full 50K dataset
+│       └── experiment_4k.json         # Phase 1 4K dataset
 │
-├── models/                       # TRAINED MODELS
-│   ├── gemma-finetuned.gguf      # Quantized model for Ollama
-│   └── gemma-finetuned-lora/     # LoRA adapters
+├── app/                                # FastAPI application
+│   └── app.py                         # Inference API
 │
-├── data/experiment/              # DATASETS
-│   ├── alpaca_data_raw.json      # Raw Alpaca dataset
-│   ├── alpaca_50k_prepared.json  # Prepared 50K dataset
-│   └── experiment_4k.json        # 4K experiment dataset
-│
-├── reports/                      # EVALUATION RESULTS
-│   ├── finetune_eval_results.json        # Finetuning results
-│   ├── teacher_comparison_report.json    # Teacher comparison
-│   └── incremental_learning/             # Incremental learning results
-│
-├── docs/                         # DOCUMENTATION AND MEDIA
-│   ├── AI_report.pdf             # Project report
-│   ├── AI_PPT.pptx               # Presentation
-│   └── demo_video.mp4            # Demo video
-│
-└── config/                       # CONFIGURATION
-    └── .env.example              # Environment template
+└── config/                             # Configuration files
 ```
-
-### Component Responsibilities
-
-| Component | Purpose | Key Files |
-|-----------|---------|-----------|
-| **app/** | API server and workers | `app.py`, `eval_first.py`, `eval_finetune.py` |
-| **colab/** | Google Colab notebooks | `base_student_colab.ipynb`, `finetune_incremental_colab.ipynb` |
-| **experiment/** | Numbered experiment scripts | `01-12_*.py` |
-| **src/database/** | Data persistence | `supabase_client.py` |
-| **src/data_generation/** | Create training data | `teacher.py`, `student.py`, `prepare_data.py` |
-| **src/training/** | Fine-tune models | `finetune.py` |
-| **src/evaluation/** | Assess quality | `update_metrics.py`, `evaluate_finetuned.py` |
-| **src/metrics/** | Scoring engine | `llm_eval.py` |
-| **scripts/** | Model utilities | `model_*.py`, `report_*.py` |
-| **sql/** | Database schemas | `01-04_schema_*.sql` |
-| **docs/** | Documentation and media | PDFs, images, video |
 
 ---
 
-## Installation Process
+## Usage Guide
 
 ### Prerequisites
 
-Before you begin, ensure you have the following installed:
-
-| Requirement | Version | Purpose |
-|------------|---------|---------|
-| **Python** | 3.10 or higher | Core runtime |
-| **NVIDIA GPU** | 8GB+ VRAM | Fine-tuning (RTX 4060 or better recommended) |
-| **System RAM** | 16GB or more | Model loading |
-| **Ollama** | Latest | Local LLM inference |
-| **Supabase Account** | Free tier | Cloud database |
-| **Git** | Latest | Clone repository |
-
----
-
-### Step 1: Clone the Repository
-
 ```bash
+# Clone repository
 git clone https://github.com/Self-eval-llm/Intune-Backend.git
 cd Intune-Backend
-```
 
----
-
-### Step 2: Set Up Python Environment
-
-**Using Virtual Environment (Recommended):**
-
-```bash
 # Create virtual environment
-python -m venv .venv
-
-# Activate virtual environment
-# On Windows PowerShell:
-.\.venv\Scripts\Activate.ps1
-
-# On Windows Command Prompt:
-.\.venv\Scripts\activate.bat
-
-# On Linux/Mac:
-source .venv/bin/activate
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+venv\Scripts\activate     # Windows
 
 # Install dependencies
-pip install -r requirements_finetune.txt
+pip install -r requirements.txt
+
+# Configure environment
+cp .env.example .env
+# Edit .env with your Supabase credentials
 ```
 
-**Using Conda (Alternative):**
+### Running Phase 1 (Teacher Comparison)
 
 ```bash
-# Create conda environment
-conda create -n llm-framework python=3.10
+# Step 1: Download Alpaca dataset
+python experiment/01_data_download_alpaca.py
 
-# Activate environment
-conda activate llm-framework
+# Step 2: Prepare 4K sample
+python experiment/02_data_prepare_4k.py
 
-# Install dependencies
-pip install -r requirements_finetune.txt
+# Step 3: Generate base outputs
+python experiment/03_gen_base_gemma.py
+
+# Step 4a: Finetune with Alpaca
+python experiment/04a_train_finetune_alpaca.py
+
+# Step 4b: Generate OSS-20B outputs
+python experiment/04b_gen_teacher_oss20b.py
+
+# Step 5: Label dataset
+python experiment/05_data_label.py
+
+# Step 6: Generate tuned outputs
+python experiment/06a_gen_tuned_alpaca.py
+
+# Step 7: Compare teachers
+python experiment/07_eval_compare_teachers.py
 ```
+
+### Running Phase 2 (Incremental Learning)
+
+#### Option A: Google Colab (Recommended)
+
+1. Upload `colab/base_student_colab.ipynb` to Colab
+2. Enable T4 GPU: Runtime → Change runtime type → T4 GPU
+3. Add Supabase credentials in Cell 2
+4. Run all cells to generate base student outputs
+5. Upload `colab/finetune_incremental_colab.ipynb`
+6. Set `STAGE = 1` and run all cells
+7. Repeat for stages 2-10
+
+#### Option B: Local GPU
+
+```bash
+# Generate base student outputs
+python experiment/11_gen_base_student.py
+
+# Run incremental stages
+python experiment/12_train_incremental.py --stage 1
+python experiment/12_train_incremental.py --stage 2
+# ... continue for stages 3-10
+```
+
+### Time Estimates (Colab T4)
+
+| Task | Time |
+|------|------|
+| Base Student Generation (50K) | ~50-60 hours |
+| Finetune per Stage (5K) | ~15 min |
+| Finetune (50K cumulative) | ~2-3 hours |
+| Generate per Stage (50K) | ~4-6 hours |
+| **Total 10 Stages** | **~60-80 hours** |
 
 ---
 
-### Step 3: Configure Environment Variables
+## Team
 
-```bash
-# Copy the environment template
-cp config/.env.example .env
+| Name | Roll Number | Role |
+|------|-------------|------|
+| **Radhakrishna Bharuka** | 24BDS063 | Lead Developer, ML Pipeline |
+| **Abhang Pawar** | 24BDS054 | Evaluation Framework |
+| **Nilesh Dwivedi** | 24BDS048 | Data Engineering |
+| **Rushikesh Masalkar** | 24BDS040 | Infrastructure, Deployment |
 
-# Edit .env file with your credentials
-# On Windows: notepad .env
-# On Linux/Mac: nano .env
-```
-
-**Add your Supabase credentials to `.env`:**
-
-```env
-# Supabase Configuration
-SUPABASE_URL=https://your-project-id.supabase.co
-SUPABASE_KEY=your-anon-or-service-key
-
-# Optional: Model Configuration
-DEFAULT_MODEL=gemma3:1b
-TEACHER_MODEL=gpt-oss:20b
-```
-
-**How to get Supabase credentials:**
-1. Go to [supabase.com](https://supabase.com) and create a free account
-2. Create a new project
-3. Navigate to **Settings** → **API**
-4. Copy the **Project URL** and **anon/public key**
+**Institution**: Indian Institute of Technology (IIT)  
+**Course**: B.Tech Data Science
 
 ---
 
-### Step 4: Set Up Database
+## Citation
 
-**Run SQL scripts in Supabase SQL Editor in the following order:**
+If you use this work, please cite:
 
-1. Open Supabase Dashboard → SQL Editor
-2. Execute `sql/01_schema_setup.sql` - Creates main table structure
-3. Execute `sql/02_schema_eval_matrix.sql` - Adds evaluation matrix columns
-4. Execute `sql/03_schema_incremental_tables.sql` - Creates incremental learning tables
-5. Execute `sql/04_schema_50k_checkpoints.sql` - Adds checkpoint columns for 50K experiment
-
-**Database Tables:**
-
-| Table | Purpose |
-|-------|---------|
-| `intune_db` | Main table for Phase 1 (4K records) |
-| `modelcomp_50k` | Phase 2 table (50K incremental learning) |
-
----
-
-### Step 5: Set Up Ollama
-
-**Install Ollama:**
-
-```bash
-# Windows (using winget):
-winget install Ollama.Ollama
-
-# Or download from https://ollama.ai
-
-# Start Ollama service
-ollama serve
-```
-
-**Pull Required Models:**
-
-Open a new terminal window and run:
-
-```bash
-# Pull base model (Gemma 1B - approximately 1.5GB)
-ollama pull gemma3:1b
-
-# Pull teacher model (GPT-OSS 20B - approximately 20GB)
-# Optional, only needed for data generation
-ollama pull gpt-oss:20b
-
-# Verify installation
-ollama list
-```
-
-**Expected Output:**
-```
-NAME              ID              SIZE      MODIFIED
-gemma3:1b         abc123def       1.5 GB    2 minutes ago
-gpt-oss:20b       def456ghi       20 GB     5 minutes ago
-```
-
----
-
-### Step 6: Verify Installation
-
-**Test database connection:**
-
-```bash
-python -c "from src.database.supabase_client import get_supabase_client; print('Database connected!' if get_supabase_client() else 'Connection failed')"
-```
-
-**Test Ollama connection:**
-
-```bash
-curl http://localhost:11434/api/tags
-```
-
-If successful, you should see a JSON response with a list of available models.
-
----
-
-## Execution Guide
-
-The framework requires **3 separate processes** running simultaneously. Each process should run in its own terminal window.
-
-### Terminal 1: API Server (Main Application)
-
-```bash
-# Activate virtual environment
-.\.venv\Scripts\Activate.ps1
-
-# Start FastAPI server
-python -m uvicorn app.app:app --host 0.0.0.0 --port 8000 --reload
-```
-
-**What it does:**
-- Serves REST API endpoints
-- Handles `/generate` requests from frontend
-- Manages database operations
-- Provides health check endpoint
-
-**Console Output:**
-```
-INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-INFO:     Started reloader process [12345] using WatchFiles
-INFO:     Started server process [12346]
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
-```
-
-**Status:** API is ready when you see "Application startup complete"
-
-**API will be available at:** `http://localhost:8000`
-
----
-
-### Terminal 2: First Evaluation Worker
-
-```bash
-# Activate virtual environment
-.\.venv\Scripts\Activate.ps1
-
-# Start first evaluation worker
-python app\eval_first.py
-```
-
-**What it does:**
-- Polls Supabase for records with `status_eval_first='created'`
-- Computes 8 evaluation metrics for base model outputs
-- Updates database with computed scores
-- Marks records as `status_eval_first='done'`
-
-**Console Output:**
-```
-INFO: Starting First Evaluation Worker...
-INFO: Polling interval: 5 seconds
-INFO: Found 3 records to evaluate
-INFO: Evaluating record 123
-INFO: Updated record 123 (Answer Relevancy: 0.7532)
-INFO: Batch complete. Processed 3 records in 2.1s
-```
-
-**Status:** Worker is active and polling
-
----
-
-### Terminal 3: Fine-tuning Worker
-
-```bash
-# Activate virtual environment
-.\.venv\Scripts\Activate.ps1
-
-# Start fine-tuning worker
-python app\eval_finetune.py
-```
-
-**What it does:**
-- Monitors record count in database
-- Triggers fine-tuning when threshold reached (default: 5000 records)
-- Trains LoRA adapters on collected data
-- Evaluates fine-tuned model and updates `*_tuned` metrics
-- Generates comparison reports
-
-**Console Output (Initial):**
-```
-INFO: Starting Fine-tuning Worker...
-INFO: Checking conditions every 60 seconds
-INFO: Records collected: 47 / 5000 (0.94%)
-INFO: Threshold not reached. Waiting...
-```
-
-**Console Output (When Triggered):**
-```
-INFO: Conditions met! Starting fine-tuning process...
-INFO: Preparing training data...
-INFO: Created train_dataset.jsonl (4500 examples)
-INFO: Created val_dataset.jsonl (500 examples)
-INFO: Starting fine-tuning with LoRA...
-INFO: Epoch 1/3 - Loss: 0.8234
-INFO: Epoch 2/3 - Loss: 0.6891
-INFO: Epoch 3/3 - Loss: 0.5743
-INFO: Fine-tuning completed successfully
-INFO: Starting final evaluation...
-INFO: Processed 100 records - Avg improvement: +12.3%
-```
-
-**Status:** Worker is monitoring; fine-tuning will trigger automatically
-
----
-
-### Testing the System
-
-**Method 1: Using curl (Command Line)**
-
-```bash
-curl -X POST http://localhost:8000/generate \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "What is machine learning?"}'
-```
-
-**Method 2: Using PowerShell**
-
-```powershell
-$body = @{
-    prompt = "What is artificial intelligence?"
-} | ConvertTo-Json
-
-Invoke-RestMethod -Uri http://localhost:8000/generate `
-  -Method Post `
-  -Body $body `
-  -ContentType "application/json"
-```
-
-**Method 3: Using Python Script**
-
-```python
-import requests
-
-response = requests.post(
-    "http://localhost:8000/generate",
-    json={"prompt": "Explain neural networks"}
-)
-
-print(response.json())
-```
-
-**Expected Response:**
-
-```json
-{
-  "response": "Machine learning is a subset of artificial intelligence...",
-  "model": "gemma3:1b",
-  "timestamp": "2025-11-16T14:30:45Z"
+```bibtex
+@misc{intune2026,
+  title={INTUNE: Self-Improving LLM via Incremental Knowledge Distillation},
+  author={Bharuka, Radhakrishna and Pawar, Abhang and Dwivedi, Nilesh and Masalkar, Rushikesh},
+  year={2026},
+  howpublished={\url{https://github.com/Self-eval-llm/Intune-Backend}},
+  note={A framework for training compact LLMs through iterative knowledge distillation}
 }
 ```
-
----
-
-### Quick Start Workflow (Small Test)
-
-For testing with 10 examples instead of 5000:
-
-```bash
-# Step 1: Generate 10 training examples
-python src\data_generation\teacher.py --n 10 --mode continuous
-
-# Step 2: Generate base model outputs
-python src\data_generation\student.py
-
-# Step 3: Compute metrics
-python src\evaluation\update_metrics.py
-
-# Step 4: Prepare training data
-python src\data_generation\prepare_data.py
-
-# Step 5: Fine-tune (edit finetune.py to use small dataset)
-python src\training\finetune.py
-
-# Step 6: Evaluate fine-tuned model
-python src\evaluation\evaluate_finetuned.py
-```
-
-**Time Estimate:** Approximately 30 minutes for complete cycle with 10 examples
-
----
-
-### Stopping the System
-
-**Graceful Shutdown:**
-
-In each terminal window, press:
-```
-Ctrl + C
-```
-
-Wait for "Shutting down gracefully..." message
-
-**Force Stop (if needed):**
-
-```bash
-# Windows PowerShell
-Get-Process python | Stop-Process
-
-# Linux/Mac
-pkill python
-```
-
----
-
-## Evaluation Metrics
-
-The system uses 8 distinct metrics to evaluate model quality:
-
-### Positive Metrics (Higher = Better)
-
-**1. Answer Relevancy (0-1)**
-- Measures how relevant the answer is to the question
-- Formula: `cosine_similarity(question_tokens, answer_tokens)`
-
-**2. Contextual Precision (0-1)**
-- Measures how much of the answer is supported by the context
-- Formula: `|answer ∩ context| / |answer|`
-
-**3. Contextual Recall (0-1)**
-- Measures how much of the context is covered in the answer
-- Formula: `|answer ∩ context| / |context|`
-
-**4. Contextual Relevancy (0-1)**
-- Measures semantic similarity between context and answer
-- Formula: `cosine_similarity(context_tokens, answer_tokens)`
-
-**5. Faithfulness (0-1)**
-- Measures alignment with reference answer and context
-- Formula: `0.6 × cos(answer, reference) + 0.4 × cos(answer, context)`
-
-### Negative Metrics (Lower = Better)
-
-**6. Toxicity (0-1)**
-- Measures presence of harmful or toxic language
-- Formula: `toxic_words / total_words`
-- Detection: Lexicon-based (offline, no API calls)
-
-**7. Hallucination Rate (0-1)**
-- Measures information not supported by context
-- Formula: `1 - contextual_precision`
-
-### Aggregate Metric
-
-**8. Overall Score (0-1)**
-- Balanced combination of all metrics
-- Formula: `mean(positive_metrics) × (1 - mean(negative_metrics))`
-
-### Example Comparison
-
-**Before Fine-tuning (Base Model):**
-
-| Metric | Score | Status |
-|--------|-------|--------|
-| Answer Relevancy | 0.6500 | Moderate |
-| Contextual Precision | 0.5815 | Moderate |
-| Contextual Recall | 0.6234 | Moderate |
-| Contextual Relevancy | 0.5892 | Moderate |
-| Faithfulness | 0.5815 | Moderate |
-| Toxicity | 0.0234 | Good |
-| Hallucination Rate | 0.4185 | Poor |
-| **Overall Score** | **0.4721** | **Moderate** |
-
-**After Fine-tuning:**
-
-| Metric | Score | Improvement | Status |
-|--------|-------|-------------|--------|
-| Answer Relevancy | 0.7850 | +20.8% | Good |
-| Contextual Precision | 0.7623 | +31.1% | Good |
-| Contextual Recall | 0.7456 | +19.6% | Good |
-| Contextual Relevancy | 0.7234 | +22.8% | Good |
-| Faithfulness | 0.7067 | +21.5% | Good |
-| Toxicity | 0.0156 | -33.3% | Excellent |
-| Hallucination Rate | 0.2377 | -43.2% | Much Better |
-| **Overall Score** | **0.6534** | **+38.4%** | **Good** |
-
----
-
-## API Documentation
-
-### Main Endpoints
-
-#### `GET /`
-Root endpoint providing API information
-
-#### `GET /health`
-Health check endpoint to monitor service status
-
-#### `POST /generate`
-Generate a response from the model
-
-**Request:**
-```json
-{
-  "prompt": "What is machine learning?"
-}
-```
-
-**Response:**
-```json
-{
-  "response": "Machine learning is a method of data analysis...",
-  "model": "gemma3:1b"
-}
-```
-
-### Interactive Documentation
-
-- **Swagger UI:** `http://localhost:8000/docs`
-- **ReDoc:** `http://localhost:8000/redoc`
-- **Detailed API docs:** See [app/README.md](app/README.md)
-
----
-
-## Technology Stack
-
-| Component | Technology |
-|-----------|-----------|
-| **Backend Framework** | FastAPI |
-| **Database** | Supabase (PostgreSQL) |
-| **LLM Inference** | Ollama / Unsloth |
-| **Base Model** | Gemma 3:1B |
-| **Teacher Model** | Alpaca-7B (Phase 2 winner) |
-| **Fine-tuning Library** | Unsloth |
-| **Fine-tuning Method** | LoRA (Low-Rank Adaptation) |
-| **Metrics Engine** | Custom implementation |
-| **Cloud Training** | Google Colab (T4 GPU) |
-| **Programming Language** | Python 3.10+ |
-
----
-
-## Phase 1 Results
-
-### Teacher Comparison (Alpaca vs OSS-20B)
-
-| Metric | Alpaca-7B | OSS-20B |
-|--------|-----------|---------|
-| Win Rate | **57.2%** | 42.8% |
-| Avg Similarity | 0.723 | 0.689 |
-| Latency | 2.1s | 8.4s |
-
-**Winner: Alpaca-7B** - Selected as teacher for Phase 2
-
----
-
-## Documentation
-
-### Available Documentation Files
-
-- **[Project Report (PDF)](docs/AI_report.pdf)** - Comprehensive technical documentation covering methodology, implementation, and results
-- **[Project Presentation (PPTX)](docs/AI_PPT.pptx)** - Visual overview of architecture, workflow, and key features
-- **[Results Analysis (PDF)](docs/result.pdf)** - Detailed evaluation results and performance metrics
-
-### Screenshots and Diagrams
-
-- **Landing Page:** [docs/intune_landingpage.png](docs/intune_landingpage.png)
-- **Full Workflow Diagram:** [docs/Full_workflow.png](docs/Full_workflow.png)
-- **Basic Workflow:** [docs/basic_workflow_figma.png](docs/basic_workflow_figma.png)
-- **Database Schema:** [docs/db_schema.png](docs/db_schema.png)
-
----
-
-## Troubleshooting
-
-### Common Issues
-
-**1. Ollama Connection Failed**
-```bash
-# Start Ollama service
-ollama serve
-
-# Check if running
-curl http://localhost:11434/api/tags
-```
-
-**2. Model Not Found**
-```bash
-# Create model from Modelfile
-ollama create gemma-finetuned -f Modelfile
-```
-
-**3. Supabase Connection Failed**
-- Verify credentials in `.env` file
-- Check network connectivity
-- Ensure table `intune_db` exists
-
-**4. Workers Not Processing**
-- Check database has records with appropriate status flags
-- Verify fine-tuned model exists at `models/gemma-finetuned-merged/`
-- Check worker logs for specific errors
 
 ---
 
@@ -1045,32 +672,13 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Acknowledgments
 
-- **Gemma** by Google for the base language model
-- **Ollama** for local LLM inference infrastructure
-- **Unsloth** for efficient fine-tuning framework
-- **Supabase** for database and backend services
+- **Stanford CRFM** for the Alpaca dataset
+- **Unsloth** for efficient fine-tuning infrastructure
+- **Google Colab** for accessible GPU compute
+- **Supabase** for database infrastructure
 
 ---
 
-## Contact and Support
-
-For questions, issues, or contributions:
-
-- **GitHub Issues:** [Report a bug](https://github.com/Self-eval-llm/Intune-Backend/issues)
-- **GitHub Discussions:** [Ask questions](https://github.com/Self-eval-llm/Intune-Backend/discussions)
-
----
-
-## Project Status
-
-**Active Development** - The project is actively maintained and continuously improving.
-
----
-
-<div align="center">
-
-**Built for the AI/ML Community**
-
-[Star this repository](https://github.com/Self-eval-llm/Intune-Backend) if you find it useful!
-
-</div>
+<p align="center">
+  <b>Built with ❤️ for advancing efficient LLM training</b>
+</p>
