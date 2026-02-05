@@ -8,6 +8,7 @@ __pycache__/
 dist/
 build/
 *.egg
+*.pyc
 
 # Virtual Environment
 .venv/
@@ -27,55 +28,24 @@ models/
 *.pth
 *.pt
 
-# Checkpoints
-checkpoints/
-
 # Cache
 .cache/
 unsloth_compiled_cache/
+**/unsloth_compiled_cache/
+**/__pycache__/
 
-# Reports
-reports/*.json
-reports/*.html
-
-# Logs
+# Logs and temp
 *.log
 logs/
+ray_temp/
+tmp/
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-*~
 
 # OS
-.DS_Store
 Thumbs.db
-desktop.ini
-
-# Data files (optional - comment out if you want to track them)
-data/raw/*.json
-data/processed/*.jsonl
-
-# llama.cpp (large repo)
-llama.cpp/
-
-# Temporary files
-*.tmp
-*.temp
-temp/
-tmp/
-
-# Jupyter Notebooks
-.ipynb_checkpoints/
-*.ipynb
-
-# Test outputs
-test_outputs/
-output*.json
-
-# Database
-*.db
-*.sqlite
-*.sqlite3
+.DS_Store

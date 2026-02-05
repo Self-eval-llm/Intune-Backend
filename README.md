@@ -1,11 +1,21 @@
-# Self-Improving LLM Evaluation Framework
+# INTUNE: Self-Improving LLM Framework
 
-An end-to-end framework for training, evaluating, and iteratively improving Large Language Models with automated feedback loops.
+An end-to-end framework for training, evaluating, and iteratively improving Large Language Models with automated feedback loops and **incremental learning**.
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-green.svg)](https://fastapi.tiangolo.com/)
+[![Unsloth](https://img.shields.io/badge/Unsloth-2025.11-orange.svg)](https://github.com/unslothai/unsloth)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/Status-Active-success.svg)]()
+[![Status](https://img.shields.io/badge/Status-Phase%202-success.svg)]()
+
+---
+
+## 🎯 Project Phases
+
+| Phase | Description | Status |
+|-------|-------------|--------|
+| **Phase 1** | Teacher Comparison (Alpaca vs OSS-20B) on 4K dataset | ✅ Complete |
+| **Phase 2** | 50K Incremental Learning with 10 Stages | 🔄 In Progress |
 
 ---
 
@@ -23,6 +33,8 @@ An end-to-end framework for training, evaluating, and iteratively improving Larg
 ## Table of Contents
 
 - [Overview](#overview)
+- [Phase 2: Incremental Learning](#phase-2-incremental-learning)
+- [Google Colab Setup](#google-colab-setup)
 - [Demo Video](#demo-video)
 - [Features](#features)
 - [System Architecture](#system-architecture)
@@ -45,8 +57,150 @@ This framework implements a self-improving Large Language Model system that:
 - Evaluates model quality using 8 comprehensive metrics
 - Fine-tunes models using efficient LoRA (Low-Rank Adaptation) adapters
 - Measures improvements quantitatively with before/after comparisons
+- **NEW: Implements 10-stage incremental learning on 50K dataset**
 - Operates continuously with background workers
 - Scales efficiently on consumer GPUs (8GB VRAM minimum)
+
+---
+
+## Phase 2: Incremental Learning
+
+### 📊 Experiment Overview
+
+Phase 2 implements **incremental learning** where the student model (Gemma 3:1B) learns progressively from the teacher (Alpaca-7B) through 10 stages.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                 INCREMENTAL LEARNING PIPELINE                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  50K Dataset (Supabase: modelcomp_50k)                         │
+│  ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐ │
+│  │ 5K  │ 5K  │ 5K  │ 5K  │ 5K  │ 5K  │ 5K  │ 5K  │ 5K  │ 5K  │ │
+│  │ S1  │ S2  │ S3  │ S4  │ S5  │ S6  │ S7  │ S8  │ S9  │ S10 │ │
+│  └─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘ │
+│                                                                 │
+│  Stage 1: Train on 5K   → Generate → Eval → student_output_ckpt1│
+│  Stage 2: Train on 10K  → Generate → Eval → student_output_ckpt2│
+│  Stage 3: Train on 15K  → Generate → Eval → student_output_ckpt3│
+│  ...                                                            │
+│  Stage 10: Train on 50K → Generate → Eval → student_output_ckpt10│
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 📁 Supabase Table: `modelcomp_50k`
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INT | Primary key |
+| `input` | TEXT | Instruction/prompt |
+| `context` | TEXT | Optional context |
+| `sevenb` | TEXT | Teacher output (Alpaca-7B) |
+| `student_output` | TEXT | Base student output (before finetuning) |
+| `student_output_ckpt1-10` | TEXT | Output after each stage |
+| `score_ckpt1-10` | DECIMAL | Similarity score per stage |
+| `latency_ckpt1-10` | DECIMAL | Generation latency per stage |
+
+### 🚀 Phase 2 Execution Steps
+
+```bash
+# Step 1: Add checkpoint columns (run in Supabase SQL Editor)
+# File: sql/04_schema_50k_checkpoints.sql
+
+# Step 2: Generate base student outputs (before finetuning)
+python experiment/11_gen_base_student.py
+
+# Step 3: Run incremental learning stages 1-10
+python experiment/12_train_incremental.py --stage 1
+python experiment/12_train_incremental.py --stage 2
+# ... continue for stages 3-10
+```
+
+---
+
+## Google Colab Setup
+
+### 🌐 Why Use Colab?
+
+| Local RTX 4060 | Colab T4 (Free) |
+|----------------|-----------------|
+| ~12-16 sec/record | ~3-5 sec/record |
+| 7 days for 50K | 2 days for 50K |
+| Your electricity | Free GPU hours |
+
+### 📓 Available Notebooks
+
+| Notebook | Purpose | Location |
+|----------|---------|----------|
+| `base_student_colab.ipynb` | Generate base student outputs for 50K | `colab/` |
+| `finetune_incremental_colab.ipynb` | Finetune + generate per stage | `colab/` |
+
+### 🔧 Step-by-Step Colab Instructions
+
+#### 1️⃣ Upload Notebook to Colab
+
+1. Go to [colab.research.google.com](https://colab.research.google.com)
+2. Click **File → Upload notebook**
+3. Select `colab/base_student_colab.ipynb` or `colab/finetune_incremental_colab.ipynb`
+
+#### 2️⃣ Enable T4 GPU
+
+1. Click **Runtime → Change runtime type**
+2. Select **T4 GPU** from Hardware accelerator dropdown
+3. Click **Save**
+
+#### 3️⃣ Get Supabase Credentials
+
+From your local `.env` file, copy:
+```
+SUPABASE_URL=https://xxxxx.supabase.co
+SUPABASE_KEY=your_service_role_key
+```
+
+#### 4️⃣ Run Base Student Notebook
+
+1. **Cell 1**: Install dependencies (~2 min)
+2. **Cell 2**: Paste your Supabase credentials
+3. **Cell 3**: Load model (~1-2 min)
+4. **Cell 4**: Check remaining records
+5. **Cell 5-6**: Setup and test generation
+6. **Cell 7**: **Start main loop** (runs until complete or timeout)
+7. **Cell 8**: Check final progress
+
+#### 5️⃣ Run Finetuning Notebook
+
+1. **Cell 2**: Set `STAGE = 1` and Supabase credentials
+2. **Cells 3-4**: Load model with LoRA adapters
+3. **Cells 5-6**: Fetch and format training data
+4. **Cell 7**: Finetune (~15-30 min per stage)
+5. **Cells 9-10**: Generate outputs for all 50K
+6. **Cell 11**: Evaluate and compare with base
+7. **Cell 12**: See summary and next steps
+
+#### 6️⃣ Continue Next Stage
+
+1. Change `STAGE = 2` in Cell 2
+2. Click **Runtime → Restart runtime**
+3. Run all cells again
+
+### ⏱️ Time Estimates
+
+| Task | Time on T4 |
+|------|------------|
+| Base Student (50K) | ~50-60 hours (4-5 sessions) |
+| Finetune (5K) | ~15 min |
+| Finetune (50K) | ~2-3 hours |
+| Generate (50K) | ~4-6 hours |
+| **Total 10 Stages** | ~60-80 hours |
+
+### 💡 Tips for Colab Free Tier
+
+- Free tier gives ~12 hours per session
+- Sessions timeout after ~90 min of inactivity
+- Progress saves to Supabase after EACH record (safe to stop)
+- Can run overnight, but keep browser tab open
+- If disconnected, just restart and it continues from where it left off
 
 ---
 
@@ -210,13 +364,12 @@ Step 8: DEPLOY AND REPEAT
 ## Repository Structure
 
 ```
-Intune-Backend/
+Intune_Backend/
 │
 ├── .env                          # Environment variables (Supabase credentials)
 ├── .gitignore                    # Git ignore rules
-├── Modelfile                     # Ollama model configuration
 ├── requirements.txt              # Core dependencies
-├── requirements_finetune.txt     # Fine-tuning dependencies
+├── requirements_finetune.txt     # Fine-tuning dependencies (Unsloth)
 ├── README.md                     # This file
 │
 ├── app/                          # APPLICATION LAYER
@@ -225,59 +378,79 @@ Intune-Backend/
 │   ├── eval_finetune.py          # Worker 2: Fine-tuning and final evaluation
 │   └── README.md                 # API documentation
 │
+├── colab/                        # GOOGLE COLAB NOTEBOOKS
+│   ├── base_student_colab.ipynb  # Generate base student outputs (50K)
+│   └── finetune_incremental_colab.ipynb  # Incremental finetuning stages
+│
+├── experiment/                   # EXPERIMENT SCRIPTS (Numbered)
+│   ├── 01_data_download_alpaca.py      # Download Alpaca dataset
+│   ├── 02_data_prepare_4k.py           # Prepare 4K subset
+│   ├── 03_gen_base_gemma.py            # Generate base Gemma outputs
+│   ├── 04a_train_finetune_alpaca.py    # Finetune with Alpaca teacher
+│   ├── 04b_gen_teacher_oss20b.py       # Generate OSS-20B outputs
+│   ├── 05_data_label.py                # Label dataset
+│   ├── 06_eval_metrics.py              # Compute evaluation metrics
+│   ├── 06a_gen_tuned_alpaca.py         # Generate tuned model outputs
+│   ├── 07_eval_compare_teachers.py     # Compare Alpaca vs OSS-20B
+│   ├── 08_gen_context.py               # Generate context
+│   ├── 09_report_analytical.py         # Generate analytical report
+│   ├── 10_data_upload_50k.py           # Upload 50K to Supabase
+│   ├── 11_gen_base_student.py          # Generate base student outputs
+│   ├── 12_train_incremental.py         # Incremental learning stages
+│   ├── EVALUATION_METRICS.md           # Metrics documentation
+│   └── README.md                       # Experiment documentation
+│
 ├── src/                          # SOURCE CODE LAYER
-│   │
+│   ├── database/                 # Database abstraction
+│   │   └── supabase_client.py    # Supabase connection and utilities
 │   ├── data_generation/          # Data pipeline
-│   │   ├── teacher.py            # Generate training examples (GPT-OSS)
-│   │   ├── student.py            # Generate base outputs (Gemma)
-│   │   └── prepare_data.py       # Format for training (JSONL)
-│   │
+│   │   ├── teacher.py            # Generate training examples
+│   │   ├── student.py            # Generate base outputs
+│   │   └── prepare_data.py       # Format for training
 │   ├── training/                 # Model fine-tuning
 │   │   └── finetune.py           # LoRA-based training
-│   │
 │   ├── evaluation/               # Quality assessment
 │   │   ├── update_metrics.py     # Compute base metrics
 │   │   ├── evaluate_finetuned.py # Compare base vs tuned
+│   │   ├── evaluate_finetuned_batch.py  # Batch evaluation
 │   │   ├── evaluate_ollama.py    # Test deployed models
 │   │   └── generate_report.py    # Create comparison reports
-│   │
-│   ├── metrics/                  # Evaluation engine
-│   │   └── llm_eval.py           # 8 metrics implementation
-│   │
-│   ├── database/                 # Database abstraction
-│   │   └── supabase_client.py    # Supabase connection and utilities
-│   │
-│   └── utils/                    # Helper functions
-│
-├── docs/                         # DOCUMENTATION AND MEDIA
-│   ├── AI_report.pdf             # Comprehensive project report
-│   ├── AI_PPT.pptx               # Project presentation
-│   ├── result.pdf                # Evaluation results
-│   ├── demo_video.mp4            # Working demo video (2 minutes)
-│   ├── intune_landingpage.png    # Landing page screenshot
-│   ├── Full_workflow.png         # Complete workflow diagram
-│   ├── basic_workflow_figma.png  # Simplified workflow
-│   └── db_schema.png             # Database schema diagram
-│
-├── sql/                          # DATABASE SCHEMAS
-│   ├── supabase_setup.sql        # Initial table setup
-│   ├── supabase_add_metrics.sql  # Add metric columns
-│   ├── add_tuned_columns.sql     # Add fine-tuned columns
-│   └── create_decimal_view.sql   # View for decimal metrics
+│   └── metrics/                  # Evaluation engine
+│       └── llm_eval.py           # 8 metrics implementation
 │
 ├── scripts/                      # UTILITY SCRIPTS
-│   ├── convert_to_gguf.py        # Convert model to GGUF format
-│   ├── create_ollama_model.py    # Create Ollama model
-│   └── cleanup.ps1               # Cleanup script
+│   ├── model_convert_gguf.py     # Convert model to GGUF format
+│   ├── model_create_ollama.py    # Create Ollama model
+│   ├── model_merge_lora.py       # Merge LoRA adapters
+│   └── report_merge_results.py   # Merge evaluation results
 │
-├── config/                       # CONFIGURATION
-│   └── .env.example              # Environment variables template
+├── sql/                          # DATABASE SCHEMAS
+│   ├── 01_schema_setup.sql       # Initial table setup
+│   ├── 02_schema_eval_matrix.sql # Evaluation matrix columns
+│   ├── 03_schema_incremental_tables.sql  # Incremental learning tables
+│   └── 04_schema_50k_checkpoints.sql     # 50K checkpoint columns
+│
+├── models/                       # TRAINED MODELS
+│   ├── gemma-finetuned.gguf      # Quantized model for Ollama
+│   └── gemma-finetuned-lora/     # LoRA adapters
+│
+├── data/experiment/              # DATASETS
+│   ├── alpaca_data_raw.json      # Raw Alpaca dataset
+│   ├── alpaca_50k_prepared.json  # Prepared 50K dataset
+│   └── experiment_4k.json        # 4K experiment dataset
 │
 ├── reports/                      # EVALUATION RESULTS
-│   └── evaluation_report_*.json  # Performance comparison reports
+│   ├── finetune_eval_results.json        # Finetuning results
+│   ├── teacher_comparison_report.json    # Teacher comparison
+│   └── incremental_learning/             # Incremental learning results
 │
-└── Supabase_csv/                 # DATA EXPORTS
-    └── *.csv                     # Database exports
+├── docs/                         # DOCUMENTATION AND MEDIA
+│   ├── AI_report.pdf             # Project report
+│   ├── AI_PPT.pptx               # Presentation
+│   └── demo_video.mp4            # Demo video
+│
+└── config/                       # CONFIGURATION
+    └── .env.example              # Environment template
 ```
 
 ### Component Responsibilities
@@ -285,14 +458,16 @@ Intune-Backend/
 | Component | Purpose | Key Files |
 |-----------|---------|-----------|
 | **app/** | API server and workers | `app.py`, `eval_first.py`, `eval_finetune.py` |
+| **colab/** | Google Colab notebooks | `base_student_colab.ipynb`, `finetune_incremental_colab.ipynb` |
+| **experiment/** | Numbered experiment scripts | `01-12_*.py` |
+| **src/database/** | Data persistence | `supabase_client.py` |
 | **src/data_generation/** | Create training data | `teacher.py`, `student.py`, `prepare_data.py` |
 | **src/training/** | Fine-tune models | `finetune.py` |
 | **src/evaluation/** | Assess quality | `update_metrics.py`, `evaluate_finetuned.py` |
 | **src/metrics/** | Scoring engine | `llm_eval.py` |
-| **src/database/** | Data persistence | `supabase_client.py` |
+| **scripts/** | Model utilities | `model_*.py`, `report_*.py` |
+| **sql/** | Database schemas | `01-04_schema_*.sql` |
 | **docs/** | Documentation and media | PDFs, images, video |
-| **sql/** | Database schemas | SQL scripts |
-| **scripts/** | Utilities | Conversion and deployment tools |
 
 ---
 
@@ -395,24 +570,17 @@ TEACHER_MODEL=gpt-oss:20b
 **Run SQL scripts in Supabase SQL Editor in the following order:**
 
 1. Open Supabase Dashboard → SQL Editor
-2. Execute `sql/supabase_setup.sql` - Creates main table structure
-3. Execute `sql/supabase_add_metrics.sql` - Adds metric columns
-4. Execute `sql/add_tuned_columns.sql` - Adds fine-tuned metric columns
-5. (Optional) Execute `sql/create_decimal_view.sql` - Creates decimal view for easier querying
+2. Execute `sql/01_schema_setup.sql` - Creates main table structure
+3. Execute `sql/02_schema_eval_matrix.sql` - Adds evaluation matrix columns
+4. Execute `sql/03_schema_incremental_tables.sql` - Creates incremental learning tables
+5. Execute `sql/04_schema_50k_checkpoints.sql` - Adds checkpoint columns for 50K experiment
 
-**Database Schema Created:**
+**Database Tables:**
 
-The `intune_db` table includes:
-- `id` - Primary key
-- `created_at` - Timestamp
-- `input` - User question
-- `actual_output` - Base model response
-- `expected_output` - Reference answer
-- `context` - Background information (JSONB)
-- `status_eval_first` - Base evaluation status
-- `status_eval_final` - Fine-tuning evaluation status
-- 8 base metric columns (INTEGER, multiply by 10000)
-- 8 fine-tuned metric columns (INTEGER, multiply by 10000)
+| Table | Purpose |
+|-------|---------|
+| `intune_db` | Main table for Phase 1 (4K records) |
+| `modelcomp_50k` | Phase 2 table (50K incremental learning) |
 
 ---
 
@@ -796,13 +964,28 @@ Generate a response from the model
 |-----------|-----------|
 | **Backend Framework** | FastAPI |
 | **Database** | Supabase (PostgreSQL) |
-| **LLM Inference** | Ollama |
-| **Base Model** | Gemma 1B |
-| **Teacher Model** | GPT-OSS 20B |
+| **LLM Inference** | Ollama / Unsloth |
+| **Base Model** | Gemma 3:1B |
+| **Teacher Model** | Alpaca-7B (Phase 2 winner) |
 | **Fine-tuning Library** | Unsloth |
 | **Fine-tuning Method** | LoRA (Low-Rank Adaptation) |
 | **Metrics Engine** | Custom implementation |
+| **Cloud Training** | Google Colab (T4 GPU) |
 | **Programming Language** | Python 3.10+ |
+
+---
+
+## Phase 1 Results
+
+### Teacher Comparison (Alpaca vs OSS-20B)
+
+| Metric | Alpaca-7B | OSS-20B |
+|--------|-----------|---------|
+| Win Rate | **57.2%** | 42.8% |
+| Avg Similarity | 0.723 | 0.689 |
+| Latency | 2.1s | 8.4s |
+
+**Winner: Alpaca-7B** - Selected as teacher for Phase 2
 
 ---
 

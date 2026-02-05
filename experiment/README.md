@@ -1,52 +1,101 @@
-# Teacher Comparison Experiment
+# INTUNE Experiment Pipeline
 
-## Research Question
-**Which teacher produces a better fine-tuned Gemma 3:1B student: Alpaca (text-davinci-003) or GPT-OSS 20B?**
+## Overview
+
+This folder contains numbered scripts for the complete experiment pipeline across two phases.
 
 ---
 
-## Pipeline Checklist
+## Phase 1: Teacher Comparison (4K Dataset)
+
+**Research Question:** Which teacher produces a better fine-tuned Gemma 3:1B student: Alpaca (7B) or GPT-OSS 20B?
+
+**Result:** ✅ **Alpaca won with 57.2% win rate**
 
 | Step | Script | Status | Description |
 |------|--------|--------|-------------|
-| 1 | `01_download_alpaca.py` | ✅ Done | Download Stanford Alpaca dataset |
-| 2 | `02_prepare_4k_dataset.py` | ✅ Done | Prepare 4K samples for experiment |
-| 3 | `03_generate_gemma_save_supabase.py` | ✅ Done | Generate Gemma outputs → Supabase |
-| 4 | `04_generate_gpt_oss_supabase.py` | ⏳ Pending | Generate OSS 20B outputs (MacBook) |
-| 5 | `05_finetune_with_alpaca.py` | ⏳ Pending | Fine-tune Gemma with Alpaca teacher |
-| 6 | `06_finetune_with_oss20b.py` | ⏳ Pending | Fine-tune Gemma with OSS 20B teacher |
-| 7 | `07_evaluate_compare_teachers.py` | ⏳ Pending | Evaluate both & declare winner |
+| 1 | `01_data_download_alpaca.py` | ✅ Done | Download Stanford Alpaca dataset |
+| 2 | `02_data_prepare_4k.py` | ✅ Done | Prepare 4K samples for experiment |
+| 3 | `03_gen_base_gemma.py` | ✅ Done | Generate Gemma outputs → Supabase |
+| 4a | `04a_train_finetune_alpaca.py` | ✅ Done | Fine-tune with Alpaca teacher |
+| 4b | `04b_gen_teacher_oss20b.py` | ✅ Done | Generate OSS 20B outputs |
+| 5 | `05_data_label.py` | ✅ Done | Label dataset |
+| 6 | `06_eval_metrics.py` | ✅ Done | Compute evaluation metrics |
+| 6a | `06a_gen_tuned_alpaca.py` | ✅ Done | Generate tuned model outputs |
+| 7 | `07_eval_compare_teachers.py` | ✅ Done | Compare teachers → **Alpaca wins** |
+| 8 | `08_gen_context.py` | ✅ Done | Generate context |
+| 9 | `09_report_analytical.py` | ✅ Done | Generate analytical report |
 
 ---
 
-## Supabase Table: `modelComp`
+## Phase 2: Incremental Learning (50K Dataset)
+
+**Goal:** Train student model progressively on 5K → 10K → ... → 50K records and measure improvement at each stage.
+
+| Step | Script | Status | Description |
+|------|--------|--------|-------------|
+| 10 | `10_data_upload_50k.py` | ✅ Done | Upload 50K to Supabase `modelcomp_50k` |
+| 11 | `11_gen_base_student.py` | 🔄 10% | Generate base student outputs (before finetuning) |
+| 12 | `12_train_incremental.py` | ⏳ Pending | Run 10 incremental learning stages |
+
+---
+
+## Supabase Tables
+
+### `modelComp` (Phase 1 - 4K records)
 
 | Column | Description |
 |--------|-------------|
 | `id` | UUID (auto-generated) |
-| `input` | Original instruction from Alpaca |
-| `context` | Context if available, else NULL |
+| `input` | Original instruction |
+| `context` | Context if available |
 | `actual_output` | Gemma 3:1B output |
-| `sevenb` | Alpaca outputs (text-davinci-003) |
+| `sevenb` | Alpaca outputs |
 | `twentyb` | GPT-OSS 20B outputs |
-| `created_at` | Auto timestamp |
-| `updated_at` | Auto timestamp |
+
+### `modelcomp_50k` (Phase 2 - 50K records)
+
+| Column | Description |
+|--------|-------------|
+| `id` | Integer (auto-generated) |
+| `input` | Instruction/prompt |
+| `context` | Optional context |
+| `sevenb` | Teacher output (Alpaca) |
+| `student_output` | Base student (before finetuning) |
+| `student_output_ckpt1-10` | Output after each stage |
+| `score_ckpt1-10` | Similarity score per stage |
+| `latency_ckpt1-10` | Generation latency per stage |
 
 ---
 
-## Commands to Run
+## Running Phase 2
 
-### Step 4: Generate OSS 20B outputs (on MacBook)
+### Option 1: Local GPU
 ```bash
-# On MacBook first:
-OLLAMA_HOST=0.0.0.0 ollama serve
+# Step 1: Generate base student outputs
+python experiment/11_gen_base_student.py
 
-# Get IP:
-ipconfig getifaddr en0
-
-# On Windows:
-python experiment/04_generate_gpt_oss_supabase.py --ip <MACBOOK_IP>
+# Step 2: Run incremental stages (one at a time)
+python experiment/12_train_incremental.py --stage 1
+python experiment/12_train_incremental.py --stage 2
+# ... continue for stages 3-10
 ```
+
+### Option 2: Google Colab (Recommended)
+1. Upload `colab/base_student_colab.ipynb` to Colab
+2. Enable T4 GPU
+3. Add Supabase credentials
+4. Run all cells
+5. Then upload `colab/finetune_incremental_colab.ipynb` for each stage
+
+---
+
+## Results Location
+
+| File | Description |
+|------|-------------|
+| `reports/teacher_comparison_report.json` | Phase 1 comparison results |
+| `reports/incremental_learning/` | Phase 2 stage-by-stage results |
 
 ### Step 5: Fine-tune with Alpaca
 ```powershell
