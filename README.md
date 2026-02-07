@@ -25,6 +25,9 @@
   - [Phase 2: Incremental Learning](#phase-2-incremental-learning-50k-dataset)
 - [Evaluation Framework](#evaluation-framework)
 - [Experimental Results](#experimental-results)
+  - [Phase 1: Teacher Comparison](#phase-1-teacher-comparison-results)
+  - [Phase 2: Incremental Learning (Preliminary)](#phase-2-incremental-learning-results-preliminary)
+  - [Phase 2: Proposed Scientific Analysis](#phase-2-proposed-scientific-analysis-planned)
 - [Technical Implementation](#technical-implementation)
 - [Repository Structure](#repository-structure)
 - [Usage Guide](#usage-guide)
@@ -38,9 +41,9 @@
 Large Language Models (LLMs) have demonstrated remarkable capabilities, but their deployment remains challenging due to computational requirements. **INTUNE** addresses this through a two-phase knowledge distillation framework:
 
 1. **Teacher Selection**: Systematic comparison of teacher models (Alpaca-7B vs GPT-OSS-20B) using 7 model-agnostic evaluation metrics on 4,000 samples
-2. **Incremental Learning**: Progressive knowledge transfer from the selected teacher to a compact student model (Gemma 3:1B) through 10 stages on 50,000 samples
+2. **Incremental Learning**: Progressive knowledge transfer from the selected teacher to a compact student model (Gemma 3:1B) through 10 checkpoints on 50,000 samples, with controlled batch comparison
 
-Our framework achieves **57.2% win rate** for the Alpaca teacher over GPT-OSS-20B, with **40.8% lower hallucination**, demonstrating that smaller, well-tuned teachers can outperform larger models for knowledge distillation tasks.
+Our framework employs a **status-based pipeline** (score → finetune → output_tuned → score_tuned → completed) for fault-tolerant, resumable training on Google Colab T4 GPUs. Phase 1 achieves **57.2% win rate** for the Alpaca teacher over GPT-OSS-20B, with **40.8% lower hallucination**, demonstrating that smaller, well-tuned teachers can outperform larger models for knowledge distillation tasks. Phase 2 evaluates both incremental and batch training strategies using 7 core metrics plus ROUGE-1, ROUGE-L, and BLEU.
 
 ---
 
@@ -50,9 +53,10 @@ Our framework achieves **57.2% win rate** for the Alpaca teacher over GPT-OSS-20
 |-------------|-------------|
 | **Teacher Selection Framework** | Novel methodology to systematically compare teacher models using 7 model-agnostic metrics without LLM-as-judge bias |
 | **Hallucination-Aware Evaluation** | Demonstrated that hallucination rate is a critical differentiator—Alpaca achieves 0.1814 vs OSS's 0.3063 |
-| **Incremental Learning Pipeline** | 10-stage progressive training (5K→50K) enabling fine-grained analysis of knowledge transfer dynamics |
-| **Comprehensive Metric Suite** | 7 automated metrics covering structure, task success, instruction following, coverage, faithfulness, hallucination, and context grounding |
-| **Reproducible Framework** | End-to-end pipeline with Supabase persistence, Colab compatibility, and detailed logging |
+| **Incremental Learning Pipeline** | 10-checkpoint progressive training (5K→50K) with status-based workflow enabling fault-tolerant, resumable execution |
+| **Incremental vs. Batch Comparison** | Controlled comparison of incremental (10-checkpoint) vs. batch (single-pass) training strategies |
+| **Comprehensive Metric Suite** | 7 automated core metrics + ROUGE-1, ROUGE-L, BLEU covering structure, task success, instruction following, coverage, faithfulness, hallucination, and context grounding |
+| **Reproducible Framework** | End-to-end pipeline with Supabase persistence, Google Colab T4 notebooks, status-based progress tracking, and detailed logging |
 
 ---
 
@@ -79,13 +83,15 @@ Our framework achieves **57.2% win rate** for the Alpaca teacher over GPT-OSS-20
 │  │                   PHASE 2: INCREMENTAL LEARNING                      │   │
 │  │                         (50K Dataset)                                │   │
 │  │                                                                      │   │
-│  │   Stage 1:  5K samples  ──→ Finetune ──→ Evaluate ──→ ckpt1        │   │
-│  │   Stage 2: 10K samples  ──→ Finetune ──→ Evaluate ──→ ckpt2        │   │
-│  │   Stage 3: 15K samples  ──→ Finetune ──→ Evaluate ──→ ckpt3        │   │
+│  │   Ckpt 1:  5K samples  ──→ Finetune ──→ Score Tuned ──→ Complete   │   │
+│  │   Ckpt 2: 10K samples  ──→ Finetune ──→ Score Tuned ──→ Complete   │   │
+│  │   Ckpt 3: 15K samples  ──→ Finetune ──→ Score Tuned ──→ Complete   │   │
 │  │     ...                                                              │   │
-│  │   Stage 10: 50K samples ──→ Finetune ──→ Evaluate ──→ ckpt10       │   │
+│  │   Ckpt 10: 50K samples ──→ Finetune ──→ Score Tuned ──→ Complete   │   │
 │  │                            ↓                                         │   │
-│  │              Learning Curve Analysis                                 │   │
+│  │   Status: score → finetune → output_tuned → score_tuned → completed │   │
+│  │                            ↓                                         │   │
+│  │              Learning Curve + Batch Comparison                       │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -198,11 +204,45 @@ Determine which teacher model produces better fine-tuned students by comparing t
 
 #### Objective
 Train the student model progressively on increasingly larger subsets (5K→10K→...→50K) to:
-1. Measure learning curve dynamics
-2. Identify optimal training data size
-3. Analyze convergence behavior
+1. Measure learning curve dynamics across 10 checkpoints
+2. Identify optimal training data size and diminishing returns thresholds
+3. Analyze convergence behavior and catastrophic forgetting
+4. Compare incremental vs. batch training strategies
+5. Generate statistically significant results with confidence intervals
 
-#### Pipeline
+#### Status-Based Workflow
+
+Phase 2 employs a **checkpoint/status-based pipeline** where each record in Supabase progresses through a well-defined state machine. This ensures fault tolerance, resumability, and fine-grained progress tracking.
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│              STATUS-BASED RECORD LIFECYCLE (Per Checkpoint)              │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   ┌─────────┐     ┌──────────┐     ┌──────────────┐     ┌────────────┐ │
+│   │  score   │ ──→ │ finetune │ ──→ │ output_tuned │ ──→ │score_tuned │ │
+│   └─────────┘     └──────────┘     └──────────────┘     └────────────┘ │
+│       │                                                       │          │
+│       │           Base scoring                   Tuned scoring │          │
+│       │           complete                       complete      │          │
+│       │                                                       ↓          │
+│       │                                              ┌────────────┐     │
+│       └─────────────────────────────────────────────→│ completed  │     │
+│                                                      └────────────┘     │
+│                                                                          │
+│   Status Flow: score → finetune → output_tuned → score_tuned →          │
+│                completed                                                 │
+│                                                                          │
+│   • score:        Record scored with base student (pre-finetune)         │
+│   • finetune:     Ready for finetuning batch                             │
+│   • output_tuned: Finetuned model output generated                       │
+│   • score_tuned:  Tuned output evaluated with 7+3 metrics                │
+│   • completed:    All processing done for this checkpoint                │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Pipeline Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -211,30 +251,77 @@ Train the student model progressively on increasingly larger subsets (5K→10K�
 │                                                                             │
 │  Supabase Table: modelcomp_50k                                              │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  id | input | context | sevenb | student_output | ckpt1..10 cols   │   │
+│  │  id | input | context | sevenb | student_output | status |         │   │
+│  │  student_output_tuned | score_tuned | latency_tuned | improvement  │   │
+│  │  student_output_batch | score_batch | latency_batch                │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
-│  Stage Execution (for stage n = 1 to 10):                                   │
-│  ────────────────────────────────────────                                   │
+│  Checkpoint Execution (for checkpoint n = 1 to 10):                         │
+│  ──────────────────────────────────────────────                             │
 │                                                                             │
-│  1. FETCH cumulative training data (n × 5,000 samples)                      │
-│     └── Stage 1: 5K, Stage 2: 10K, ..., Stage 10: 50K                      │
+│  1. FETCH records WHERE status = 'finetune' AND checkpoint = n              │
+│     └── 5,000 records per checkpoint (cumulative training)                  │
 │                                                                             │
-│  2. FINETUNE Gemma 3:1B with LoRA                                           │
-│     └── Training time: ~15-30 min per 5K on T4 GPU                          │
+│  2. FINETUNE Gemma 3:1B with LoRA on cumulative data                        │
+│     └── Ckpt 1: 5K, Ckpt 2: 10K, ..., Ckpt 10: 50K                        │
+│     └── Save LoRA adapter to Google Drive / local                           │
 │                                                                             │
-│  3. GENERATE outputs for all 50K samples                                    │
-│     └── Store in: student_output_ckpt{n}                                    │
+│  3. GENERATE tuned outputs for checkpoint records                           │
+│     └── Store in: student_output_tuned                                      │
+│     └── Update status: 'finetune' → 'output_tuned'                         │
 │                                                                             │
-│  4. EVALUATE using 7-metric framework                                       │
-│     └── Store in: score_ckpt{n}                                            │
+│  4. EVALUATE using 7-metric + ROUGE/BLEU framework                          │
+│     └── Store in: score_tuned, latency_tuned                               │
+│     └── Compute improvement = score_tuned - score (base)                    │
+│     └── Update status: 'output_tuned' → 'score_tuned' → 'completed'        │
 │                                                                             │
-│  5. COMPARE with previous checkpoint                                        │
-│     └── Log improvement/degradation metrics                                 │
-│                                                                             │
-│  6. SAVE checkpoint and proceed to next stage                               │
+│  5. REPORT per-checkpoint metrics and cumulative analysis                    │
+│     └── Log improvement/degradation vs previous checkpoint                  │
+│     └── Save to reports/incremental_learning/                               │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Incremental vs. Batch Comparison
+
+A key research contribution is the **controlled comparison** between incremental and batch training:
+
+| Aspect | Incremental Training | Batch Training |
+|--------|---------------------|----------------|
+| **Approach** | Progressive: 5K → 10K → ... → 50K | Single pass: All 50K at once |
+| **Checkpoints** | 10 (one per 5K increment) | 1 (final model only) |
+| **Output Column** | `student_output_tuned` | `student_output_batch` |
+| **Score Column** | `score_tuned` | `score_batch` |
+| **Latency Column** | `latency_tuned` | `latency_batch` |
+| **Analysis** | Learning curve dynamics | Performance ceiling |
+| **Compute Cost** | ~10 × finetuning runs | 1 × finetuning run |
+
+Both approaches are implemented in dedicated Colab notebooks for reproducibility:
+- **Incremental**: `colab/finetune_incremental_colab.ipynb` — runs one checkpoint at a time
+- **Batch**: `colab/finetune_batch_colab.ipynb` — finetunes on full 50K in a single run
+
+#### Extended Evaluation Metrics
+
+Phase 2 extends the 7-metric evaluation suite with additional text overlap metrics:
+
+| # | Metric | Type | Description |
+|---|--------|------|-------------|
+| 1-7 | Core 7 Metrics | Model-Agnostic | See [Evaluation Framework](#evaluation-framework) |
+| 8 | **ROUGE-1** | Token Overlap | Unigram overlap with teacher reference |
+| 9 | **ROUGE-L** | Longest Common Subsequence | LCS-based similarity with teacher |
+| 10 | **BLEU** | n-gram Precision | Modified n-gram precision against teacher |
+
+```python
+# Extended scoring for Phase 2
+from rouge_score import rouge_scorer
+from nltk.translate.bleu_score import sentence_bleu
+
+scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
+rouge_scores = scorer.score(reference=teacher_output, hypothesis=student_output)
+bleu = sentence_bleu([teacher_output.split()], student_output.split())
+
+# Combined score includes all 10 metrics
+overall = mean(7_core_metrics) × (1 - hallucination) + rouge_bleu_bonus
 ```
 
 #### Data Schema (modelcomp_50k)
@@ -243,15 +330,36 @@ Train the student model progressively on increasingly larger subsets (5K→10K�
 |--------|------|-------------|
 | `id` | INT | Primary key (1-50000) |
 | `checkpoint` | INT | Which 5K batch (1-10) |
+| `status` | TEXT | Record lifecycle state (score/finetune/output_tuned/score_tuned/completed) |
 | `input` | TEXT | Instruction/prompt |
 | `context` | TEXT | Optional context |
 | `sevenb` | TEXT | Teacher output (Alpaca-7B) |
 | `student_output` | TEXT | Base student output (pre-finetuning) |
+| `score` | DECIMAL | Base student overall score |
 | `generation_latency` | DECIMAL | Base generation time (seconds) |
-| `student_output_ckpt1` | TEXT | Output after Stage 1 training |
-| `score_ckpt1` | DECIMAL | Similarity score after Stage 1 |
-| `latency_ckpt1` | DECIMAL | Generation latency after Stage 1 |
-| ... | ... | Columns repeat for ckpt2-10 |
+| `student_output_tuned` | TEXT | Finetuned model output (incremental) |
+| `score_tuned` | DECIMAL | Finetuned model overall score |
+| `latency_tuned` | DECIMAL | Finetuned generation latency |
+| `improvement` | DECIMAL | score_tuned − score (per-record delta) |
+| `student_output_batch` | TEXT | Batch-trained model output |
+| `score_batch` | DECIMAL | Batch-trained overall score |
+| `latency_batch` | DECIMAL | Batch-trained generation latency |
+
+#### Colab Training Infrastructure
+
+All Phase 2 training runs on **Google Colab T4 GPU** for reproducibility and accessibility:
+
+| Setting | Value |
+|---------|-------|
+| **GPU** | NVIDIA T4 (16 GB VRAM) |
+| **Install** | `pip install unsloth` (manages full dependency tree) |
+| **Model Loading** | `unsloth/gemma-3-1b-it-bnb-4bit` via FastModel |
+| **LoRA Targets** | q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj |
+| **Optimizer** | AdamW 8-bit |
+| **Epochs per Checkpoint** | 1 (Colab) / 3 (full run) |
+| **MAX_NEW_TOKENS** | 512 |
+| **Model Persistence** | Google Drive mount for LoRA adapter checkpoints |
+| **Database** | Supabase PostgreSQL (remote, persistent across sessions) |
 
 ---
 
@@ -443,6 +551,137 @@ overall = mean(positive) × (1 - mean(negative))
 
 ---
 
+### Phase 2: Proposed Scientific Analysis (Planned)
+
+> **Note**: The following analysis sections are **proposed/planned** and will be populated once all 10 checkpoint runs are complete. They outline the scientific analyses we intend to perform on the incremental learning results.
+
+#### 1. Learning Curve Across All 10 Checkpoints
+
+Comprehensive learning curve tracking overall score as training data increases from 5K to 50K samples.
+
+```
+  Overall Score
+  ↑
+  │                                          ← Convergence zone?
+  │                              ┌───────────────────────
+  │                         ┌────┘
+  │                    ┌────┘
+  │               ┌────┘
+  │          ┌────┘
+  │     ┌────┘
+  │┌────┘
+  │┘
+  └──────────────────────────────────────────→ Training Data
+   5K   10K   15K   20K   25K   30K   35K   40K   45K   50K
+   C1    C2    C3    C4    C5    C6    C7    C8    C9    C10
+```
+
+*Planned table — to be updated with actual results:*
+
+| Checkpoint | Training Data | Train Loss | Eval Loss | Overall Score | Δ Score | Cumulative Δ |
+|------------|--------------|------------|-----------|---------------|---------|--------------|
+| 1 | 5K | 1.0814 | 0.9278 | 0.4883 | — | — |
+| 2 | 10K | 1.0757 | 1.0042 | 0.4904 | +0.0021 | +0.0021 |
+| 3 | 15K | *pending* | *pending* | *pending* | — | — |
+| 4 | 20K | *pending* | *pending* | *pending* | — | — |
+| 5 | 25K | *pending* | *pending* | *pending* | — | — |
+| 6 | 30K | *pending* | *pending* | *pending* | — | — |
+| 7 | 35K | *pending* | *pending* | *pending* | — | — |
+| 8 | 40K | *pending* | *pending* | *pending* | — | — |
+| 9 | 45K | *pending* | *pending* | *pending* | — | — |
+| 10 | 50K | *pending* | *pending* | *pending* | — | — |
+
+#### 2. Comprehensive Metric Evolution Table
+
+Full 10-checkpoint evolution for all 7 core metrics + ROUGE/BLEU, enabling identification of per-metric convergence patterns.
+
+*Planned table — to be updated with actual results:*
+
+| Metric | C1 | C2 | C3 | C4 | C5 | C6 | C7 | C8 | C9 | C10 | Trend |
+|--------|----|----|----|----|----|----|----|----|----|----|-------|
+| Structured Correctness | 0.5211 | 0.5189 | — | — | — | — | — | — | — | — | *TBD* |
+| Task Success | 0.6072 | 0.6105 | — | — | — | — | — | — | — | — | *TBD* |
+| Instruction Following | 0.9907 | 0.9905 | — | — | — | — | — | — | — | — | *TBD* |
+| Coverage | 0.2922 | 0.2951 | — | — | — | — | — | — | — | — | *TBD* |
+| Faithfulness | 0.4092 | 0.4151 | — | — | — | — | — | — | — | — | *TBD* |
+| Hallucination ↓ | 0.2587 | 0.2573 | — | — | — | — | — | — | — | — | *TBD* |
+| Context Grounding | 0.8226 | 0.8273 | — | — | — | — | — | — | — | — | *TBD* |
+| ROUGE-1 | — | — | — | — | — | — | — | — | — | — | *TBD* |
+| ROUGE-L | — | — | — | — | — | — | — | — | — | — | *TBD* |
+| BLEU | — | — | — | — | — | — | — | — | — | — | *TBD* |
+| **Overall Score** | **0.4883** | **0.4904** | — | — | — | — | — | — | — | — | *TBD* |
+
+#### 3. Training Efficiency Analysis (Planned)
+
+Planned analyses on training dynamics:
+
+- **Loss Curves**: Train loss vs. eval loss across all 10 checkpoints — watching for overfitting signals (eval loss increasing while train loss decreases)
+- **Training Time Scaling**: How cumulative training time grows as dataset size increases (expected: sub-linear due to early convergence)
+- **Inference Latency**: Generation latency evolution — does finetuning affect generation speed?
+- **Data Efficiency**: Score improvement per 5K additional samples — identifying the cost-benefit sweet spot
+
+$$\text{Data Efficiency}_n = \frac{\text{Score}_{n} - \text{Score}_{n-1}}{5000 \text{ samples}}$$
+
+#### 4. Statistical Significance Analysis (Planned)
+
+For robust scientific claims, the following statistical tests will be applied:
+
+- **Confidence Intervals**: 95% CI for each metric at each checkpoint using bootstrap sampling
+- **Paired t-tests**: Checkpoint-to-checkpoint significance testing (H₀: no improvement)
+- **Effect Sizes**: Cohen's d for practical significance beyond statistical significance
+- **Multiple Comparison Correction**: Bonferroni correction for testing across 10 checkpoints
+
+$$\text{Cohen's } d = \frac{\bar{X}_{ckpt_n} - \bar{X}_{ckpt_{n-1}}}{s_{pooled}}$$
+
+#### 5. Diminishing Returns Analysis (Planned)
+
+Identifying the **knee point** where additional training data yields minimal improvement:
+
+- **Marginal Improvement**: Δ Score per checkpoint (expected to decrease)
+- **Cost-Benefit Ratio**: Score gain vs. compute cost (training time + inference time)
+- **Knee Identification**: Using the Kneedle algorithm or second derivative test
+- **Optimal Data Size**: Recommendation for minimum data needed to achieve X% of maximum performance
+
+$$\text{Marginal Return}_n = \frac{\Delta\text{Score}_n}{\Delta\text{Compute}_n} = \frac{\text{Score}_n - \text{Score}_{n-1}}{\text{Time}_n}$$
+
+#### 6. Category-Wise Performance Evolution (Planned)
+
+Per-task-category analysis across all 10 checkpoints to identify:
+- Which categories benefit most from additional training data
+- Whether certain categories plateau earlier than others
+- Task-specific convergence patterns
+
+*Planned table — to be updated with actual results:*
+
+| Category | Base Score | C1 | C2 | ... | C10 | Total Δ | Best Ckpt |
+|----------|-----------|----|----|-----|-----|---------|-----------|
+| general_qa | *pending* | — | — | — | — | — | — |
+| classification_analysis | *pending* | — | — | — | — | — | — |
+| creative_generative | *pending* | — | — | — | — | — | — |
+| language_editing | *pending* | — | — | — | — | — | — |
+| math_logic | *pending* | — | — | — | — | — | — |
+| technical_code | *pending* | — | — | — | — | — | — |
+
+#### 7. Incremental vs. Batch Comparison Results (Planned)
+
+Head-to-head comparison of incremental (10-checkpoint) vs. batch (single-pass) training:
+
+| Metric | Base Student | Incremental (C10) | Batch (50K) | Winner |
+|--------|-------------|-------------------|-------------|--------|
+| Overall Score | *pending* | *pending* | *pending* | *TBD* |
+| Training Time | — | *pending* | *pending* | *TBD* |
+| Hallucination ↓ | *pending* | *pending* | *pending* | *TBD* |
+| Faithfulness | *pending* | *pending* | *pending* | *TBD* |
+| Coverage | *pending* | *pending* | *pending* | *TBD* |
+
+**Research Questions**:
+1. Does incremental training achieve comparable performance to batch training?
+2. Is there a catastrophic forgetting effect in incremental training?
+3. Does the batch model overfit more or less than the incremental approach?
+4. Which approach generalizes better to under-represented task categories?
+
+---
+
 ## Technical Implementation
 
 ### Dependencies
@@ -503,19 +742,23 @@ Intune_Backend/
 │   ├── 09_report_analytical.py        # Generate analytical reports
 │   ├── 10_data_upload_50k.py          # Upload 50K dataset to Supabase
 │   ├── 11_gen_base_student.py         # Generate base student outputs (50K)
-│   ├── 12_train_incremental.py        # 10-stage incremental training
+│   ├── 12_train_incremental.py        # 10-checkpoint incremental training (status-based)
 │   ├── EVALUATION_METRICS.md          # Detailed metric documentation
 │   └── README.md                       # Experiment pipeline docs
 │
 ├── colab/                              # Google Colab notebooks
 │   ├── base_student_colab.ipynb       # Generate base student (50K)
-│   └── finetune_incremental_colab.ipynb # Incremental finetuning
+│   ├── finetune_incremental_colab.ipynb # Incremental finetuning (per checkpoint)
+│   └── finetune_batch_colab.ipynb     # Batch finetuning (full 50K comparison)
 │
 ├── sql/                                # Database schemas
 │   ├── 01_schema_setup.sql            # Initial Supabase setup
 │   ├── 02_schema_eval_matrix.sql      # Evaluation columns
 │   ├── 03_schema_incremental_tables.sql # Incremental learning tables
-│   └── 04_schema_50k_checkpoints.sql  # 50K checkpoint columns
+│   ├── 04_schema_50k_checkpoints.sql  # 50K checkpoint columns
+│   ├── 05_schema_batch_columns.sql    # Batch comparison columns
+│   ├── 05_schema_incremental_pipeline.sql # Status-based pipeline schema
+│   └── 06_cleanup_legacy_columns.sql  # Migration from ckpt columns to status-based
 │
 ├── scripts/                            # Utility scripts
 │   ├── model_convert_gguf.py          # Convert to GGUF format
@@ -602,13 +845,31 @@ python experiment/07_eval_compare_teachers.py
 
 #### Option A: Google Colab (Recommended)
 
-1. Upload `colab/base_student_colab.ipynb` to Colab
+**Step 1: Generate Base Student Outputs**
+1. Upload `colab/base_student_colab.ipynb` to Google Colab
 2. Enable T4 GPU: Runtime → Change runtime type → T4 GPU
-3. Add Supabase credentials in Cell 2
-4. Run all cells to generate base student outputs
-5. Upload `colab/finetune_incremental_colab.ipynb`
-6. Set `STAGE = 1` and run all cells
-7. Repeat for stages 2-10
+3. Add Supabase credentials (`SUPABASE_URL`, `SUPABASE_KEY`) in Cell 2
+4. Run all cells — generates base student outputs for 50K records
+5. Records will be updated with `student_output`, `score`, and `status='finetune'`
+
+**Step 2: Incremental Finetuning (10 Checkpoints)**
+1. Upload `colab/finetune_incremental_colab.ipynb` to Google Colab
+2. Enable T4 GPU and add Supabase credentials
+3. Set `CHECKPOINT = 1` in the config cell
+4. Run all cells — the notebook will:
+   - Fetch records where `status='finetune'` for the current checkpoint
+   - Finetune Gemma 3:1B with LoRA on cumulative data
+   - Generate `student_output_tuned` for checkpoint records
+   - Score with 7 metrics + ROUGE/BLEU → `score_tuned`
+   - Calculate `improvement` = score_tuned − score
+   - Update status to `completed`
+5. Increment `CHECKPOINT = 2` and repeat for checkpoints 2–10
+6. LoRA adapters are saved to Google Drive for persistence
+
+**Step 3: Batch Comparison (Optional)**
+1. Upload `colab/finetune_batch_colab.ipynb` to Google Colab
+2. Run all cells — trains on full 50K at once
+3. Generates `student_output_batch`, `score_batch`, `latency_batch`
 
 #### Option B: Local GPU
 
@@ -616,10 +877,10 @@ python experiment/07_eval_compare_teachers.py
 # Generate base student outputs
 python experiment/11_gen_base_student.py
 
-# Run incremental stages
-python experiment/12_train_incremental.py --stage 1
-python experiment/12_train_incremental.py --stage 2
-# ... continue for stages 3-10
+# Run incremental checkpoints (status-based workflow)
+python experiment/12_train_incremental.py --checkpoint 1
+python experiment/12_train_incremental.py --checkpoint 2
+# ... continue for checkpoints 3-10
 ```
 
 ### Time Estimates (Colab T4)
