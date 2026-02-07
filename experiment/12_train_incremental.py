@@ -1,17 +1,54 @@
 """
-Stage-by-Stage Incremental Learning with Evaluation
-====================================================
-For each stage (1-10):
-1. Finetune on cumulative data (Stage 1=5K, Stage 2=10K, etc.)
-2. Generate outputs with finetuned model
-3. Evaluate against teacher (sevenb) and compare with previous checkpoint
-4. Update Supabase with student_output_ckptN, score_ckptN, latency_ckptN
-5. STOP - run next stage manually
+Incremental Learning Pipeline with Status-Based Workflow
+=========================================================
+Status Flow for each checkpoint (5000 records):
+  score        -> Score base student_output vs teacher (all metrics)
+  finetune     -> Finetune model on this checkpoint's data  
+  output_tuned -> Generate student_output_tuned with finetuned model
+  score_tuned  -> Score tuned output vs teacher (all metrics with _tuned suffix)
+  completed    -> Calculate improvement for each metric
+
+IMPORTANT: Each step validates that 5000 records exist with the required status
+           before proceeding. Records start with status='score'.
+
+Columns used:
+  - input, context: Input data
+  - sevenb: Teacher output (expected output)
+  - student_output: Base model output
+  - student_output_tuned: Finetuned model output
+  - latency, latency_tuned: Inference times
+  - checkpoint: Checkpoint number (1-10)
+  - status: Workflow status
+  
+  Before Finetuning (base student):
+  - score, structured_correctness, task_success, instruction_following
+  - coverage, faithfulness, hallucination, context_grounding, conciseness
+  - rouge1, rougeL, bleu
+  
+  After Finetuning (tuned student):
+  - score_tuned, structured_correctness_tuned, task_success_tuned, instruction_following_tuned
+  - coverage_tuned, faithfulness_tuned, hallucination_tuned, context_grounding_tuned, conciseness_tuned
+  - rouge1_tuned, rougeL_tuned, bleu_tuned
+  
+  Improvement:
+  - improvement (score_tuned - score)
 
 Usage:
-    python experiment/12_stage_incremental.py --stage 1
-    python experiment/12_stage_incremental.py --stage 2
-    ...
+    # Check status of a checkpoint
+    python experiment/12_train_incremental.py --checkpoint 1 --step status
+    
+    # Run individual steps
+    python experiment/12_train_incremental.py --checkpoint 1 --step score
+    python experiment/12_train_incremental.py --checkpoint 1 --step finetune
+    python experiment/12_train_incremental.py --checkpoint 1 --step output_tuned
+    python experiment/12_train_incremental.py --checkpoint 1 --step score_tuned
+    python experiment/12_train_incremental.py --checkpoint 1 --step completed
+    
+    # Run all steps for a checkpoint automatically
+    python experiment/12_train_incremental.py --checkpoint 1 --run-all
+    
+    # Initialize checkpoint (set status to 'score')
+    python experiment/12_train_incremental.py --checkpoint 1 --init
 """
 
 import os
@@ -33,17 +70,21 @@ from trl import SFTTrainer
 from transformers import TrainingArguments
 from datasets import Dataset
 
-# Evaluation imports
+# Evaluation imports - use comprehensive metrics from 06_eval_metrics
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from importlib import import_module
+eval_metrics = import_module('06_eval_metrics')
+evaluate_single_output = eval_metrics.evaluate_single_output
+compare_teacher_student = eval_metrics.compare_teacher_student
+
 from rouge_score import rouge_scorer
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-from sklearn.metrics.pairwise import cosine_similarity
-from sentence_transformers import SentenceTransformer
 
 # Config
 MODEL_NAME = "unsloth/gemma-3-1b-it-bnb-4bit"
 MAX_SEQ_LENGTH = 2048
-RECORDS_PER_STAGE = 5000
-EVAL_SAMPLE_SIZE = 500  # Evaluate on 500 samples per stage
+RECORDS_PER_CHECKPOINT = 5000
 MAX_NEW_TOKENS = 512
 
 # LoRA Config
@@ -51,103 +92,511 @@ LORA_R = 16
 LORA_ALPHA = 16
 LORA_DROPOUT = 0
 
+# Status flow (removed 'eo' - start from 'score')
+STATUS_FLOW = ['score', 'finetune', 'output_tuned', 'score_tuned', 'completed']
+MIN_RECORDS_PER_CHECKPOINT = 5000
+
 def get_supabase():
     """Get Supabase client"""
     return create_client(os.getenv('SUPABASE_URL'), os.getenv('SUPABASE_KEY'))
 
-def fetch_training_data(supabase, stage):
-    """Fetch cumulative training data up to this stage"""
-    # Stage 1 = checkpoints 1 (5K)
-    # Stage 2 = checkpoints 1-2 (10K)
-    # etc.
-    print(f"\nFetching training data for Stage {stage} (checkpoints 1-{stage})...")
-    
-    all_data = []
-    for ckpt in range(1, stage + 1):
-        result = supabase.table('modelcomp_50k')\
-            .select('id, input, context, sevenb')\
-            .eq('checkpoint', ckpt)\
-            .execute()
-        all_data.extend(result.data)
-    
-    print(f"Fetched {len(all_data)} training records")
-    return all_data
-
-def fetch_eval_data(supabase, stage):
-    """Fetch evaluation data - use records from current stage"""
-    print(f"\nFetching evaluation data from Stage {stage}...")
+def fetch_records_by_status(supabase, checkpoint, status):
+    """Fetch records for a checkpoint with specific status"""
+    print(f"\nFetching checkpoint {checkpoint} records with status='{status}'...")
     
     result = supabase.table('modelcomp_50k')\
-        .select('id, input, context, sevenb, student_output')\
-        .eq('checkpoint', stage)\
-        .limit(EVAL_SAMPLE_SIZE)\
+        .select('*')\
+        .eq('checkpoint', checkpoint)\
+        .eq('status', status)\
         .execute()
     
-    print(f"Fetched {len(result.data)} evaluation records")
+    print(f"Fetched {len(result.data)} records")
     return result.data
 
-def format_for_training(data):
-    """Format data for SFT training"""
+def validate_records_count(records, step_name, min_required=MIN_RECORDS_PER_CHECKPOINT):
+    """Validate that we have minimum required records for a step.
+    Returns True if validation passed, False otherwise.
+    Always prints status of ready/remaining records.
+    """
+    count = len(records)
+    remaining = max(0, min_required - count)
+    pct_ready = (count / min_required) * 100 if min_required > 0 else 0
+    
+    print(f"\n{'─'*50}")
+    print(f"📊 DATA READINESS CHECK: {step_name}")
+    print(f"{'─'*50}")
+    print(f"   Records ready:     {count:,}")
+    print(f"   Records required:  {min_required:,}")
+    print(f"   Records remaining: {remaining:,}")
+    print(f"   Progress:          {pct_ready:.1f}%")
+    
+    # Visual progress bar
+    bar_length = 40
+    filled = int(bar_length * count / min_required) if min_required > 0 else 0
+    bar = '█' * filled + '░' * (bar_length - filled)
+    print(f"   [{bar}]")
+    print(f"{'─'*50}")
+    
+    if count < min_required:
+        print(f"\n❌ VALIDATION FAILED: {step_name}")
+        print(f"   Need {remaining:,} more records to proceed.")
+        print(f"   Current: {count:,} / {min_required:,} ({pct_ready:.1f}% ready)")
+        print(f"\n   💡 Collect more data and run --init again, or wait for more records.")
+        return False
+    
+    print(f"✅ Validation passed: {count:,} records ready for {step_name}")
+    return True
+
+def fetch_checkpoint_records(supabase, checkpoint):
+    """Fetch all records for a checkpoint"""
+    print(f"\nFetching all records for checkpoint {checkpoint}...")
+    
+    result = supabase.table('modelcomp_50k')\
+        .select('*')\
+        .eq('checkpoint', checkpoint)\
+        .execute()
+    
+    print(f"Fetched {len(result.data)} records")
+    return result.data
+
+def update_status(supabase, record_ids, new_status):
+    """Update status for multiple records"""
+    print(f"\nUpdating {len(record_ids)} records to status='{new_status}'...")
+    
+    for rid in tqdm(record_ids, desc="Updating status"):
+        supabase.table('modelcomp_50k').update({
+            'status': new_status
+        }).eq('id', rid).execute()
+
+def calculate_metrics(prediction, reference, instruction="", context="", task_label="general_qa"):
+    """
+    Calculate comprehensive evaluation metrics using 06_eval_metrics module.
+    
+    Returns dict with all metrics:
+    - structured_correctness
+    - task_success
+    - instruction_following
+    - coverage
+    - faithfulness
+    - hallucination
+    - context_grounding
+    - conciseness
+    - overall_score (weighted combination)
+    """
+    if not prediction or not reference:
+        return {
+            'overall': 0.0,
+            'structured_correctness': 0.0,
+            'task_success': 0.0,
+            'instruction_following': 0.0,
+            'coverage': 0.0,
+            'faithfulness': 0.0,
+            'hallucination': 0.0,
+            'context_grounding': 0.0,
+            'conciseness': 0.0,
+            'rouge1': 0.0,
+            'rouge2': 0.0,
+            'rougeL': 0.0,
+            'bleu': 0.0
+        }
+    
+    # Use comprehensive evaluation from 06_eval_metrics
+    eval_result = evaluate_single_output(
+        instruction=instruction,
+        student_output=prediction,
+        teacher_output=reference,
+        context=context,
+        task_label=task_label
+    )
+    
+    # Also calculate basic ROUGE/BLEU for backwards compatibility
+    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+    rouge_scores = scorer.score(reference, prediction)
+    
+    smooth = SmoothingFunction().method1
+    try:
+        bleu = sentence_bleu([reference.split()], prediction.split(), smoothing_function=smooth)
+    except:
+        bleu = 0.0
+    
+    return {
+        # Comprehensive metrics
+        'overall': eval_result['overall_score'],
+        'structured_correctness': eval_result['structured_correctness'],
+        'task_success': eval_result['task_success'],
+        'instruction_following': eval_result['instruction_following'],
+        'coverage': eval_result['coverage'],
+        'faithfulness': eval_result['faithfulness'],
+        'hallucination': eval_result['hallucination'],
+        'context_grounding': eval_result['context_grounding'],
+        'conciseness': eval_result['conciseness'],
+        # Basic metrics
+        'rouge1': rouge_scores['rouge1'].fmeasure,
+        'rouge2': rouge_scores['rouge2'].fmeasure,
+        'rougeL': rouge_scores['rougeL'].fmeasure,
+        'bleu': bleu,
+        # Details
+        'details': eval_result.get('details', {})
+    }
+
+def generate_output(model, tokenizer, instruction, context=""):
+    """Generate output with model"""
+    if context:
+        prompt = f"### Instruction:\n{instruction}\n\n### Context:\n{context}\n\n### Response:\n"
+    else:
+        prompt = f"### Instruction:\n{instruction}\n\n### Response:\n"
+    
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    
+    start_time = time.time()
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    latency = (time.time() - start_time) * 1000
+    
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    if "### Response:" in response:
+        response = response.split("### Response:")[-1].strip()
+    
+    return response, latency
+
+# =============================================================================
+# STATUS CHECK - View current checkpoint status
+# =============================================================================
+def step_status(supabase, checkpoint):
+    """Show status summary for a checkpoint with detailed readiness info"""
+    print(f"\n{'='*60}")
+    print(f"📊 STATUS SUMMARY - Checkpoint {checkpoint}")
+    print(f"{'='*60}")
+    
+    # Count records by status
+    all_records = fetch_checkpoint_records(supabase, checkpoint)
+    
+    status_counts = {}
+    for status in STATUS_FLOW + [None, '']:
+        status_counts[status if status else 'null/empty'] = 0
+    
+    for r in all_records:
+        s = r.get('status')
+        if s in status_counts:
+            status_counts[s] += 1
+        elif not s:
+            status_counts['null/empty'] += 1
+        else:
+            status_counts[s] = status_counts.get(s, 0) + 1
+    
+    print(f"\n   Total records: {len(all_records)}")
+    print(f"   Required per step: {MIN_RECORDS_PER_CHECKPOINT}")
+    print(f"\n   Status Distribution:")
+    print(f"   {'─'*50}")
+    
+    # Find the active step (first one with records but not enough)
+    next_step = None
+    ready_count = 0
+    
+    for status in ['null/empty'] + STATUS_FLOW:
+        count = status_counts.get(status, 0)
+        pct = (count / MIN_RECORDS_PER_CHECKPOINT) * 100 if MIN_RECORDS_PER_CHECKPOINT > 0 else 0
+        
+        # Visual progress bar for each status
+        bar_length = 30
+        filled = int(bar_length * min(count / MIN_RECORDS_PER_CHECKPOINT, 1)) if MIN_RECORDS_PER_CHECKPOINT > 0 else 0
+        bar = '█' * filled + '░' * (bar_length - filled)
+        
+        ready = '✅' if count >= MIN_RECORDS_PER_CHECKPOINT else '⏳' if count > 0 else '❌'
+        print(f"   {ready} {status:15} : {count:5} / {MIN_RECORDS_PER_CHECKPOINT} [{bar}] {pct:.0f}%")
+        
+        # Track the next actionable step
+        if status in STATUS_FLOW and count > 0 and next_step is None:
+            next_step = status
+            ready_count = count
+    
+    # Detailed readiness summary
+    print(f"\n   {'─'*50}")
+    print(f"   📈 READINESS SUMMARY")
+    print(f"   {'─'*50}")
+    
+    if next_step:
+        remaining = max(0, MIN_RECORDS_PER_CHECKPOINT - ready_count)
+        pct_ready = (ready_count / MIN_RECORDS_PER_CHECKPOINT) * 100
+        
+        print(f"   Next step:         --step {next_step}")
+        print(f"   Records ready:     {ready_count:,}")
+        print(f"   Records remaining: {remaining:,}")
+        print(f"   Progress:          {pct_ready:.1f}%")
+        
+        if ready_count >= MIN_RECORDS_PER_CHECKPOINT:
+            print(f"\n   ✅ READY TO RUN: python experiment/12_train_incremental.py --checkpoint {checkpoint} --step {next_step}")
+        else:
+            print(f"\n   ⏳ WAITING: Need {remaining:,} more records for '{next_step}' step")
+            print(f"      Collect more data or wait for pipeline to accumulate records.")
+    else:
+        null_count = status_counts.get('null/empty', 0)
+        if null_count > 0:
+            remaining = max(0, MIN_RECORDS_PER_CHECKPOINT - null_count)
+            print(f"   Uninitialized:     {null_count:,}")
+            print(f"   Records remaining: {remaining:,}")
+            print(f"\n   ⚠️  Run --init to initialize {null_count:,} records")
+            if null_count < MIN_RECORDS_PER_CHECKPOINT:
+                print(f"      Then collect {remaining:,} more records before running --step score")
+        else:
+            completed = status_counts.get('completed', 0)
+            if completed >= MIN_RECORDS_PER_CHECKPOINT:
+                print(f"   ✅ Checkpoint {checkpoint} COMPLETED!")
+                if checkpoint < 10:
+                    print(f"      Ready for checkpoint {checkpoint + 1}")
+    
+    print(f"{'='*60}")
+    return status_counts
+
+# =============================================================================
+# INIT - Initialize checkpoint records to 'score' status
+# =============================================================================
+def init_checkpoint(supabase, checkpoint):
+    """Initialize checkpoint by setting status to 'score' for records without status"""
+    print(f"\n{'='*60}")
+    print(f"🔧 INIT - Initialize Checkpoint {checkpoint}")
+    print(f"{'='*60}")
+    
+    # Fetch records with null/empty status
+    result = supabase.table('modelcomp_50k')\
+        .select('id, sevenb, student_output')\
+        .eq('checkpoint', checkpoint)\
+        .or_('status.is.null,status.eq.')\
+        .execute()
+    
+    records = result.data
+    print(f"Found {len(records)} records without status")
+    
+    # Validate they have required data
+    valid_records = []
+    missing_sevenb = 0
+    missing_student = 0
+    
+    for r in records:
+        if not r.get('sevenb'):
+            missing_sevenb += 1
+        elif not r.get('student_output'):
+            missing_student += 1
+        else:
+            valid_records.append(r['id'])
+    
+    if missing_sevenb > 0:
+        print(f"⚠️  {missing_sevenb} records missing teacher output (sevenb)")
+    if missing_student > 0:
+        print(f"⚠️  {missing_student} records missing base student output")
+    
+    # Show readiness status
+    count = len(valid_records)
+    remaining = max(0, MIN_RECORDS_PER_CHECKPOINT - count)
+    pct_ready = (count / MIN_RECORDS_PER_CHECKPOINT) * 100 if MIN_RECORDS_PER_CHECKPOINT > 0 else 0
+    
+    print(f"\n{'─'*50}")
+    print(f"📊 DATA READINESS FOR CHECKPOINT {checkpoint}")
+    print(f"{'─'*50}")
+    print(f"   Records ready:     {count:,}")
+    print(f"   Records required:  {MIN_RECORDS_PER_CHECKPOINT:,}")
+    print(f"   Records remaining: {remaining:,}")
+    print(f"   Progress:          {pct_ready:.1f}%")
+    
+    # Visual progress bar
+    bar_length = 40
+    filled = int(bar_length * count / MIN_RECORDS_PER_CHECKPOINT) if MIN_RECORDS_PER_CHECKPOINT > 0 else 0
+    bar = '█' * filled + '░' * (bar_length - filled)
+    print(f"   [{bar}]")
+    print(f"{'─'*50}")
+    
+    if valid_records:
+        print(f"\n✅ {len(valid_records)} records ready to initialize")
+        update_status(supabase, valid_records, 'score')
+        print(f"✅ Status set to 'score' - ready for scoring")
+        
+        if count < MIN_RECORDS_PER_CHECKPOINT:
+            print(f"\n⚠️  WARNING: Only {count:,} records initialized.")
+            print(f"   Need {remaining:,} more records before running --step score")
+            print(f"   Pipeline will wait until {MIN_RECORDS_PER_CHECKPOINT:,} records are ready.")
+    else:
+        print("❌ No valid records to initialize")
+    
+    return len(valid_records)
+
+# =============================================================================
+# STEP 1: score - Score Base Student Output
+# =============================================================================
+def step_score(supabase, checkpoint):
+    """Score base student_output against teacher (sevenb) using full evaluation matrix"""
+    print(f"\n{'='*60}")
+    print(f"📊 STEP: score - Score Base Student for Checkpoint {checkpoint}")
+    print(f"   Using comprehensive evaluation metrics...")
+    print(f"{'='*60}")
+    
+    records = fetch_records_by_status(supabase, checkpoint, 'score')
+    
+    # Validate minimum records
+    if not validate_records_count(records, 'score'):
+        return 0
+    
+    all_metrics = []
+    for item in tqdm(records, desc="Scoring with full matrix"):
+        student_out = item.get('student_output', '')
+        teacher_out = item.get('sevenb', '')
+        instruction = item.get('input', '')
+        context = item.get('context', '')
+        task_label = item.get('task_label', 'general_qa')
+        
+        if student_out and teacher_out:
+            metrics = calculate_metrics(
+                prediction=student_out,
+                reference=teacher_out,
+                instruction=instruction,
+                context=context,
+                task_label=task_label
+            )
+            score = round(metrics['overall'], 4)
+        else:
+            metrics = None
+            score = None
+        
+        # Update all scores in Supabase as individual columns
+        update_data = {
+            'score': score,
+            'status': 'finetune'
+        }
+        
+        # Store ALL metrics as individual columns (before finetuning)
+        if metrics:
+            update_data['structured_correctness'] = round(metrics['structured_correctness'], 4)
+            update_data['task_success'] = round(metrics['task_success'], 4)
+            update_data['instruction_following'] = round(metrics['instruction_following'], 4)
+            update_data['coverage'] = round(metrics['coverage'], 4)
+            update_data['faithfulness'] = round(metrics['faithfulness'], 4)
+            update_data['hallucination'] = round(metrics['hallucination'], 4)
+            update_data['context_grounding'] = round(metrics['context_grounding'], 4)
+            update_data['conciseness'] = round(metrics['conciseness'], 4)
+            update_data['rouge1'] = round(metrics['rouge1'], 4)
+            update_data['rougeL'] = round(metrics['rougeL'], 4)
+            update_data['bleu'] = round(metrics['bleu'], 4)
+        
+        supabase.table('modelcomp_50k').update(update_data).eq('id', item['id']).execute()
+        
+        if metrics:
+            all_metrics.append(metrics)
+    
+    # Print summary of all metrics
+    if all_metrics:
+        print(f"\n{'='*60}")
+        print(f"📊 BASE STUDENT EVALUATION SUMMARY (Checkpoint {checkpoint})")
+        print(f"{'='*60}")
+        print(f"   Records evaluated: {len(all_metrics)}")
+        print(f"   ─────────────────────────────────────")
+        print(f"   Overall Score:         {sum(m['overall'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   ─────────────────────────────────────")
+        print(f"   Structured Correctness: {sum(m['structured_correctness'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   Task Success:           {sum(m['task_success'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   Instruction Following:  {sum(m['instruction_following'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   Coverage:               {sum(m['coverage'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   Faithfulness:           {sum(m['faithfulness'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   Hallucination:          {sum(m['hallucination'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   Context Grounding:      {sum(m['context_grounding'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   Conciseness:            {sum(m['conciseness'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   ─────────────────────────────────────")
+        print(f"   ROUGE-1:                {sum(m['rouge1'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   ROUGE-L:                {sum(m['rougeL'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   BLEU:                   {sum(m['bleu'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"{'='*60}")
+    
+    avg_score = sum(m['overall'] for m in all_metrics) / len(all_metrics) if all_metrics else 0
+    print(f"\n✅ Status updated to 'finetune' - ready for finetuning")
+    
+    return avg_score
+
+# =============================================================================
+# STEP 3: finetune - Finetune Model on Checkpoint Data
+# =============================================================================
+def step_finetune(supabase, checkpoint):
+    """Finetune model on checkpoint data"""
+    print(f"\n{'='*60}")
+    print(f"🔧 STEP: finetune - Train on Checkpoint {checkpoint}")
+    print(f"{'='*60}")
+    
+    records = fetch_records_by_status(supabase, checkpoint, 'finetune')
+    
+    # Validate minimum records
+    if not validate_records_count(records, 'finetune'):
+        return None
+    
+    # Format training data
     formatted = []
-    for item in data:
+    for item in records:
         context = item.get('context') or ''
         if context:
             text = f"### Instruction:\n{item['input']}\n\n### Context:\n{context}\n\n### Response:\n{item['sevenb']}"
         else:
             text = f"### Instruction:\n{item['input']}\n\n### Response:\n{item['sevenb']}"
         formatted.append({"text": text})
-    return Dataset.from_list(formatted)
-
-def load_base_model():
-    """Load base model with LoRA"""
-    print(f"\nLoading {MODEL_NAME}...")
     
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=MODEL_NAME,
-        max_seq_length=MAX_SEQ_LENGTH,
-        dtype=None,
-        load_in_4bit=True,
-    )
+    dataset = Dataset.from_list(formatted)
+    print(f"Training on {len(dataset)} records")
     
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=LORA_R,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                       "gate_proj", "up_proj", "down_proj"],
-        lora_alpha=LORA_ALPHA,
-        lora_dropout=LORA_DROPOUT,
-        bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=42,
-    )
-    
-    return model, tokenizer
-
-def load_previous_checkpoint(stage):
-    """Load model from previous checkpoint if exists"""
-    if stage == 1:
-        return load_base_model()
-    
-    prev_path = f"models/gemma-stage{stage-1}-lora"
-    if os.path.exists(prev_path):
-        print(f"\nLoading previous checkpoint from {prev_path}...")
+    # Load model (previous checkpoint or base)
+    if checkpoint == 1:
+        print(f"\nLoading base model {MODEL_NAME}...")
         model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=prev_path,
+            model_name=MODEL_NAME,
             max_seq_length=MAX_SEQ_LENGTH,
             dtype=None,
             load_in_4bit=True,
         )
-        return model, tokenizer
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=LORA_R,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                           "gate_proj", "up_proj", "down_proj"],
+            lora_alpha=LORA_ALPHA,
+            lora_dropout=LORA_DROPOUT,
+            bias="none",
+            use_gradient_checkpointing="unsloth",
+            random_state=42,
+        )
     else:
-        print(f"No previous checkpoint found, starting from base model")
-        return load_base_model()
-
-def train_stage(model, tokenizer, dataset, stage):
-    """Train model on stage data"""
-    output_dir = f"models/gemma-stage{stage}-lora"
+        prev_path = f"models/gemma-ckpt{checkpoint-1}-lora"
+        if os.path.exists(prev_path):
+            print(f"\nLoading previous checkpoint from {prev_path}...")
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                model_name=prev_path,
+                max_seq_length=MAX_SEQ_LENGTH,
+                dtype=None,
+                load_in_4bit=True,
+            )
+        else:
+            print(f"No previous checkpoint, loading base model...")
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                model_name=MODEL_NAME,
+                max_seq_length=MAX_SEQ_LENGTH,
+                dtype=None,
+                load_in_4bit=True,
+            )
+            model = FastLanguageModel.get_peft_model(
+                model,
+                r=LORA_R,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                               "gate_proj", "up_proj", "down_proj"],
+                lora_alpha=LORA_ALPHA,
+                lora_dropout=LORA_DROPOUT,
+                bias="none",
+                use_gradient_checkpointing="unsloth",
+                random_state=42,
+            )
     
-    print(f"\nTraining Stage {stage} on {len(dataset)} records...")
-    print(f"Output: {output_dir}")
+    # Train
+    output_dir = f"models/gemma-ckpt{checkpoint}-lora"
     
     trainer = SFTTrainer(
         model=model,
@@ -177,79 +626,51 @@ def train_stage(model, tokenizer, dataset, stage):
     
     trainer.train()
     
-    # Save LoRA
+    # Save
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
+    print(f"✅ Model saved to {output_dir}")
     
-    print(f"✅ Stage {stage} training complete! Saved to {output_dir}")
-    return model, tokenizer
+    # Update status
+    record_ids = [r['id'] for r in records]
+    update_status(supabase, record_ids, 'output_tuned')
+    print(f"✅ Status updated to 'output_tuned' - ready for tuned generation")
+    
+    return output_dir
 
-def generate_output(model, tokenizer, instruction, context=""):
-    """Generate output with finetuned model"""
-    if context:
-        prompt = f"### Instruction:\n{instruction}\n\n### Context:\n{context}\n\n### Response:\n"
-    else:
-        prompt = f"### Instruction:\n{instruction}\n\n### Response:\n"
+# =============================================================================
+# STEP 4: output_tuned - Generate Tuned Student Output
+# =============================================================================
+def step_output_tuned(supabase, checkpoint):
+    """Generate student_output_tuned using finetuned model"""
+    print(f"\n{'='*60}")
+    print(f"🤖 STEP: output_tuned - Generate Tuned Output for Checkpoint {checkpoint}")
+    print(f"{'='*60}")
     
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    records = fetch_records_by_status(supabase, checkpoint, 'output_tuned')
     
-    start_time = time.time()
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=MAX_NEW_TOKENS,
-            do_sample=True,
-            temperature=0.7,
-            top_p=0.9,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-    latency = (time.time() - start_time) * 1000
+    # Validate minimum records
+    if not validate_records_count(records, 'output_tuned'):
+        return 0
     
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    if "### Response:" in response:
-        response = response.split("### Response:")[-1].strip()
+    # Load finetuned model
+    model_path = f"models/gemma-ckpt{checkpoint}-lora"
+    if not os.path.exists(model_path):
+        print(f"❌ Model not found: {model_path}")
+        print("Run 'finetune' step first.")
+        return 0
     
-    return response, latency
-
-def calculate_metrics(prediction, reference):
-    """Calculate evaluation metrics"""
-    # ROUGE
-    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
-    rouge_scores = scorer.score(reference, prediction)
-    
-    # BLEU
-    smooth = SmoothingFunction().method1
-    try:
-        bleu = sentence_bleu([reference.split()], prediction.split(), smoothing_function=smooth)
-    except:
-        bleu = 0.0
-    
-    # Overall score (weighted average)
-    overall = (
-        rouge_scores['rouge1'].fmeasure * 0.3 +
-        rouge_scores['rougeL'].fmeasure * 0.4 +
-        bleu * 0.3
+    print(f"\nLoading finetuned model from {model_path}...")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_path,
+        max_seq_length=MAX_SEQ_LENGTH,
+        dtype=None,
+        load_in_4bit=True,
     )
-    
-    return {
-        'rouge1': rouge_scores['rouge1'].fmeasure,
-        'rouge2': rouge_scores['rouge2'].fmeasure,
-        'rougeL': rouge_scores['rougeL'].fmeasure,
-        'bleu': bleu,
-        'overall': overall
-    }
-
-def generate_and_evaluate(model, tokenizer, eval_data, stage):
-    """Generate outputs and evaluate"""
-    print(f"\nGenerating and evaluating on {len(eval_data)} samples...")
-    
     FastLanguageModel.for_inference(model)
     
-    results = []
-    all_scores = []
-    
-    for item in tqdm(eval_data, desc="Evaluating"):
+    # Generate outputs
+    for item in tqdm(records, desc="Generating"):
         try:
             output, latency = generate_output(
                 model, tokenizer,
@@ -257,172 +678,291 @@ def generate_and_evaluate(model, tokenizer, eval_data, stage):
                 item.get('context', '')
             )
             
-            # Calculate metrics against teacher (sevenb)
-            metrics = calculate_metrics(output, item['sevenb'])
-            
-            results.append({
-                'id': item['id'],
-                'output': output[:5000],
-                'latency': round(latency, 3),
-                'score': round(metrics['overall'], 4),
-                'metrics': metrics
-            })
-            
-            all_scores.append(metrics['overall'])
+            supabase.table('modelcomp_50k').update({
+                'student_output_tuned': output[:5000],
+                'latency_tuned': round(latency, 3),
+                'status': 'score_tuned'
+            }).eq('id', item['id']).execute()
             
         except Exception as e:
             print(f"Error on record {item['id']}: {e}")
             continue
     
-    avg_score = sum(all_scores) / len(all_scores) if all_scores else 0
-    print(f"\n📊 Stage {stage} Average Score: {avg_score:.4f}")
+    print(f"✅ Generated tuned outputs for {len(records)} records")
+    print(f"✅ Status updated to 'score_tuned' - ready for final scoring")
     
-    return results, avg_score
+    return len(records)
 
-def update_supabase(supabase, results, stage):
-    """Update Supabase with stage results"""
-    output_col = f"student_output_ckpt{stage}"
-    score_col = f"score_ckpt{stage}"
-    latency_col = f"latency_ckpt{stage}"
+# =============================================================================
+# STEP 5: score_tuned - Score Tuned Student Output
+# =============================================================================
+def step_score_tuned(supabase, checkpoint):
+    """Score student_output_tuned against teacher (sevenb) using full evaluation matrix"""
+    print(f"\n{'='*60}")
+    print(f"📊 STEP: score_tuned - Score Tuned Output for Checkpoint {checkpoint}")
+    print(f"   Using comprehensive evaluation metrics...")
+    print(f"{'='*60}")
     
-    print(f"\nUpdating Supabase: {output_col}, {score_col}, {latency_col}...")
+    records = fetch_records_by_status(supabase, checkpoint, 'score_tuned')
     
-    for result in tqdm(results, desc="Updating"):
+    # Validate minimum records
+    if not validate_records_count(records, 'score_tuned'):
+        return 0
+    
+    all_metrics = []
+    for item in tqdm(records, desc="Scoring tuned with full matrix"):
+        tuned_out = item.get('student_output_tuned', '')
+        teacher_out = item.get('sevenb', '')
+        instruction = item.get('input', '')
+        context = item.get('context', '')
+        task_label = item.get('task_label', 'general_qa')
+        
+        if tuned_out and teacher_out:
+            metrics = calculate_metrics(
+                prediction=tuned_out,
+                reference=teacher_out,
+                instruction=instruction,
+                context=context,
+                task_label=task_label
+            )
+            score_tuned = round(metrics['overall'], 4)
+        else:
+            metrics = None
+            score_tuned = None
+        
+        # Update all scores in Supabase as individual columns with _tuned suffix
+        update_data = {
+            'score_tuned': score_tuned,
+            'status': 'completed'
+        }
+        
+        # Store ALL metrics as individual columns (after finetuning with _tuned suffix)
+        if metrics:
+            update_data['structured_correctness_tuned'] = round(metrics['structured_correctness'], 4)
+            update_data['task_success_tuned'] = round(metrics['task_success'], 4)
+            update_data['instruction_following_tuned'] = round(metrics['instruction_following'], 4)
+            update_data['coverage_tuned'] = round(metrics['coverage'], 4)
+            update_data['faithfulness_tuned'] = round(metrics['faithfulness'], 4)
+            update_data['hallucination_tuned'] = round(metrics['hallucination'], 4)
+            update_data['context_grounding_tuned'] = round(metrics['context_grounding'], 4)
+            update_data['conciseness_tuned'] = round(metrics['conciseness'], 4)
+            update_data['rouge1_tuned'] = round(metrics['rouge1'], 4)
+            update_data['rougeL_tuned'] = round(metrics['rougeL'], 4)
+            update_data['bleu_tuned'] = round(metrics['bleu'], 4)
+        
+        supabase.table('modelcomp_50k').update(update_data).eq('id', item['id']).execute()
+        
+        if metrics:
+            all_metrics.append(metrics)
+    
+    # Print summary of all metrics
+    if all_metrics:
+        print(f"\n{'='*60}")
+        print(f"📊 TUNED STUDENT EVALUATION SUMMARY (Checkpoint {checkpoint})")
+        print(f"{'='*60}")
+        print(f"   Records evaluated: {len(all_metrics)}")
+        print(f"   ─────────────────────────────────────")
+        print(f"   Overall Score:         {sum(m['overall'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   ─────────────────────────────────────")
+        print(f"   Structured Correctness: {sum(m['structured_correctness'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   Task Success:           {sum(m['task_success'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   Instruction Following:  {sum(m['instruction_following'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   Coverage:               {sum(m['coverage'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   Faithfulness:           {sum(m['faithfulness'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   Hallucination:          {sum(m['hallucination'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   Context Grounding:      {sum(m['context_grounding'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   Conciseness:            {sum(m['conciseness'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   ─────────────────────────────────────")
+        print(f"   ROUGE-1:                {sum(m['rouge1'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   ROUGE-L:                {sum(m['rougeL'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   BLEU:                   {sum(m['bleu'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"{'='*60}")
+    
+    avg_score = sum(m['overall'] for m in all_metrics) / len(all_metrics) if all_metrics else 0
+    print(f"\n✅ Status updated to 'completed' - ready for final calculation")
+    
+    return avg_score
+
+# =============================================================================
+# STEP 6: completed - Calculate Final Improvement
+# =============================================================================
+def step_completed(supabase, checkpoint):
+    """Calculate improvement score and generate report"""
+    print(f"\n{'='*60}")
+    print(f"✅ STEP: completed - Calculate Improvement for Checkpoint {checkpoint}")
+    print(f"{'='*60}")
+    
+    records = fetch_records_by_status(supabase, checkpoint, 'completed')
+    
+    # Validate minimum records
+    if not validate_records_count(records, 'completed'):
+        return None
+    
+    # Calculate improvements
+    improvements = []
+    for item in tqdm(records, desc="Calculating improvement"):
+        score_before = item.get('score') or 0
+        score_after = item.get('score_tuned') or 0
+        improvement = round(score_after - score_before, 4)
+        
         supabase.table('modelcomp_50k').update({
-            output_col: result['output'],
-            score_col: result['score'],
-            latency_col: result['latency']
-        }).eq('id', result['id']).execute()
-    
-    print(f"✅ Updated {len(results)} records")
-
-def compare_with_previous(supabase, stage, current_score):
-    """Compare current stage score with previous"""
-    print(f"\n📈 Stage {stage} Comparison:")
-    print(f"   Current score: {current_score:.4f}")
-    
-    if stage == 1:
-        # Compare with base student_output
-        result = supabase.table('modelcomp_50k')\
-            .select('student_output, sevenb')\
-            .eq('checkpoint', 1)\
-            .limit(EVAL_SAMPLE_SIZE)\
-            .execute()
+            'improvement': improvement
+        }).eq('id', item['id']).execute()
         
-        if result.data and result.data[0].get('student_output'):
-            base_scores = []
-            for item in result.data:
-                if item.get('student_output') and item.get('sevenb'):
-                    metrics = calculate_metrics(item['student_output'], item['sevenb'])
-                    base_scores.append(metrics['overall'])
-            
-            if base_scores:
-                base_avg = sum(base_scores) / len(base_scores)
-                improvement = current_score - base_avg
-                print(f"   Base model score: {base_avg:.4f}")
-                print(f"   Improvement: {improvement:+.4f} ({improvement/base_avg*100:+.1f}%)")
-                return {'base': base_avg, 'current': current_score, 'improvement': improvement}
-    else:
-        # Compare with previous checkpoint
-        prev_col = f"score_ckpt{stage-1}"
-        result = supabase.table('modelcomp_50k')\
-            .select(prev_col)\
-            .eq('checkpoint', stage)\
-            .not_.is_(prev_col, 'null')\
-            .limit(EVAL_SAMPLE_SIZE)\
-            .execute()
+        if score_before and score_after:
+            improvements.append({
+                'before': score_before,
+                'after': score_after,
+                'improvement': improvement
+            })
+    
+    # Summary
+    if improvements:
+        avg_before = sum(i['before'] for i in improvements) / len(improvements)
+        avg_after = sum(i['after'] for i in improvements) / len(improvements)
+        avg_improvement = sum(i['improvement'] for i in improvements) / len(improvements)
+        pct_improvement = (avg_improvement / avg_before * 100) if avg_before else 0
         
-        if result.data:
-            prev_scores = [r[prev_col] for r in result.data if r.get(prev_col)]
-            if prev_scores:
-                prev_avg = sum(prev_scores) / len(prev_scores)
-                improvement = current_score - prev_avg
-                print(f"   Previous stage score: {prev_avg:.4f}")
-                print(f"   Improvement: {improvement:+.4f} ({improvement/prev_avg*100:+.1f}%)")
-                return {'previous': prev_avg, 'current': current_score, 'improvement': improvement}
+        print(f"\n{'='*60}")
+        print(f"📈 CHECKPOINT {checkpoint} RESULTS")
+        print(f"{'='*60}")
+        print(f"   Records processed: {len(improvements)}")
+        print(f"   Avg Score Before:  {avg_before:.4f}")
+        print(f"   Avg Score After:   {avg_after:.4f}")
+        print(f"   Avg Improvement:   {avg_improvement:+.4f} ({pct_improvement:+.1f}%)")
+        print(f"{'='*60}")
+        
+        # Save report
+        report = {
+            'checkpoint': checkpoint,
+            'timestamp': datetime.now().isoformat(),
+            'records': len(improvements),
+            'score_before': avg_before,
+            'score_after': avg_after,
+            'improvement': avg_improvement,
+            'improvement_pct': pct_improvement
+        }
+        
+        os.makedirs('reports/incremental', exist_ok=True)
+        report_path = f"reports/incremental/checkpoint_{checkpoint}_report.json"
+        with open(report_path, 'w') as f:
+            json.dump(report, f, indent=2)
+        print(f"📄 Report saved: {report_path}")
+        
+        return report
     
-    return {'current': current_score}
+    return None
 
-def save_stage_report(stage, avg_score, comparison, eval_results):
-    """Save stage report to file"""
-    report = {
-        'stage': stage,
-        'timestamp': datetime.now().isoformat(),
-        'training_records': stage * RECORDS_PER_STAGE,
-        'eval_samples': len(eval_results),
-        'average_score': avg_score,
-        'comparison': comparison,
-        'sample_results': eval_results[:5]  # Save first 5 as samples
-    }
+# =============================================================================
+# RUN ALL - Execute all steps for a checkpoint
+# =============================================================================
+def run_all_steps(supabase, checkpoint):
+    """Run all steps for a checkpoint automatically"""
+    print(f"\n{'='*60}")
+    print(f"🚀 RUNNING ALL STEPS FOR CHECKPOINT {checkpoint}")
+    print(f"{'='*60}")
     
-    report_path = f"reports/stage{stage}_report.json"
-    os.makedirs('reports', exist_ok=True)
+    results = {}
     
-    with open(report_path, 'w') as f:
-        json.dump(report, f, indent=2)
+    for step in STATUS_FLOW:
+        print(f"\n{'─'*60}")
+        print(f"▶️  Starting step: {step}")
+        print(f"{'─'*60}")
+        
+        if step == 'score':
+            result = step_score(supabase, checkpoint)
+        elif step == 'finetune':
+            result = step_finetune(supabase, checkpoint)
+        elif step == 'output_tuned':
+            result = step_output_tuned(supabase, checkpoint)
+        elif step == 'score_tuned':
+            result = step_score_tuned(supabase, checkpoint)
+        elif step == 'completed':
+            result = step_completed(supabase, checkpoint)
+        
+        results[step] = result
+        
+        # Check if step failed (returned 0/None for steps that should return data)
+        if result is None or (isinstance(result, (int, float)) and result == 0):
+            print(f"\n❌ Step '{step}' did not complete successfully. Stopping.")
+            break
     
-    print(f"\n📄 Report saved: {report_path}")
+    print(f"\n{'='*60}")
+    print(f"📋 RUN ALL SUMMARY - Checkpoint {checkpoint}")
+    print(f"{'='*60}")
+    for step, result in results.items():
+        status = '✅' if result else '❌'
+        print(f"   {status} {step}: {result}")
+    
+    return results
 
+# =============================================================================
+# MAIN
+# =============================================================================
 def main():
-    parser = argparse.ArgumentParser(description='Run incremental learning stage')
-    parser.add_argument('--stage', type=int, required=True, help='Stage number (1-10)')
-    parser.add_argument('--skip-train', action='store_true', help='Skip training, only evaluate')
+    parser = argparse.ArgumentParser(description='Incremental Learning Pipeline')
+    parser.add_argument('--checkpoint', type=int, required=True, help='Checkpoint number (1-10)')
+    parser.add_argument('--step', type=str, 
+                       choices=STATUS_FLOW + ['status'],
+                       help='Step to run: score, finetune, output_tuned, score_tuned, completed, status')
+    parser.add_argument('--run-all', action='store_true', help='Run all steps for checkpoint')
+    parser.add_argument('--init', action='store_true', help='Initialize checkpoint (set status to score)')
     args = parser.parse_args()
     
-    if args.stage < 1 or args.stage > 10:
-        print("Error: Stage must be 1-10")
+    if args.checkpoint < 1 or args.checkpoint > 10:
+        print("Error: Checkpoint must be 1-10")
         sys.exit(1)
     
-    stage = args.stage
+    # Validate arguments
+    if not args.step and not args.run_all and not args.init:
+        print("Error: Must specify --step, --run-all, or --init")
+        parser.print_help()
+        sys.exit(1)
+    
+    checkpoint = args.checkpoint
+    
     print(f"\n{'='*60}")
-    print(f"🚀 STAGE {stage} INCREMENTAL LEARNING")
-    print(f"   Training on: {stage * RECORDS_PER_STAGE} cumulative records")
-    print(f"   Evaluating on: {EVAL_SAMPLE_SIZE} samples")
+    print(f"🚀 INCREMENTAL LEARNING - Checkpoint {checkpoint}")
     print(f"{'='*60}")
     
     supabase = get_supabase()
     
-    # Step 1: Fetch data
-    train_data = fetch_training_data(supabase, stage)
-    eval_data = fetch_eval_data(supabase, stage)
+    # Handle --init
+    if args.init:
+        init_checkpoint(supabase, checkpoint)
+        return
     
-    # Step 2: Load model
-    if args.skip_train and os.path.exists(f"models/gemma-stage{stage}-lora"):
-        print(f"\nLoading existing Stage {stage} model...")
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            f"models/gemma-stage{stage}-lora",
-            max_seq_length=MAX_SEQ_LENGTH,
-            dtype=None,
-            load_in_4bit=True,
-        )
-    else:
-        # Load previous checkpoint or base model
-        model, tokenizer = load_previous_checkpoint(stage)
-        
-        # Step 3: Train
-        dataset = format_for_training(train_data)
-        model, tokenizer = train_stage(model, tokenizer, dataset, stage)
+    # Handle --run-all
+    if args.run_all:
+        run_all_steps(supabase, checkpoint)
+        return
     
-    # Step 4: Generate and evaluate
-    eval_results, avg_score = generate_and_evaluate(model, tokenizer, eval_data, stage)
+    step = args.step
     
-    # Step 5: Update Supabase
-    update_supabase(supabase, eval_results, stage)
+    # Run the appropriate step
+    if step == 'status':
+        step_status(supabase, checkpoint)
+    elif step == 'score':
+        step_score(supabase, checkpoint)
+    elif step == 'finetune':
+        step_finetune(supabase, checkpoint)
+    elif step == 'output_tuned':
+        step_output_tuned(supabase, checkpoint)
+    elif step == 'score_tuned':
+        step_score_tuned(supabase, checkpoint)
+    elif step == 'completed':
+        step_completed(supabase, checkpoint)
     
-    # Step 6: Compare with previous
-    comparison = compare_with_previous(supabase, stage, avg_score)
-    
-    # Step 7: Save report
-    save_stage_report(stage, avg_score, comparison, eval_results)
-    
-    # Summary
-    print(f"\n{'='*60}")
-    print(f"✅ STAGE {stage} COMPLETE!")
-    print(f"   Score: {avg_score:.4f}")
-    if comparison.get('improvement'):
-        print(f"   Improvement: {comparison['improvement']:+.4f}")
-    print(f"\n   Next: python experiment/12_stage_incremental.py --stage {stage+1}")
-    print(f"{'='*60}\n")
+    # Show next step (only for non-status steps)
+    if step != 'status' and step in STATUS_FLOW:
+        current_idx = STATUS_FLOW.index(step)
+        if current_idx < len(STATUS_FLOW) - 1:
+            next_step = STATUS_FLOW[current_idx + 1]
+            print(f"\n   Next: python experiment/12_train_incremental.py --checkpoint {checkpoint} --step {next_step}")
+        else:
+            print(f"\n   ✅ Checkpoint {checkpoint} complete!")
+            if checkpoint < 10:
+                print(f"   Next checkpoint: python experiment/12_train_incremental.py --checkpoint {checkpoint + 1} --init")
 
 if __name__ == "__main__":
     main()
