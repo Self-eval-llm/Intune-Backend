@@ -8,8 +8,8 @@
 - **Status**: ✅ FIXED
 
 **Changes:**
-- Updated `torch>=2.0.0` → `torch>=2.1.2` in `requirements.txt`
-- PyTorch 2.1.2+ includes fix for unsafe tensor deserialization
+- Updated `torch>=2.0.0` → `torch>=2.6.0` in `requirements.txt`
+- PyTorch 2.6.0 is the first release with the patch for CVE-2024-50266
 - Using `FastLanguageModel.from_pretrained()` (safe wrapper) instead of direct `torch.load()`
 
 **Files Changed:**
@@ -21,7 +21,7 @@
 
 ### 2. **MODERATE: PyTorch Resource Shutdown/Release (CVE-2024-50267)**
 - **Severity**: Moderate  
-- **Description**: Improper resource management could cause memory leaks
+- **Description**: Improper resource management (use-after-free) could cause memory leaks or instability
 - **Status**: ✅ FIXED
 
 **Changes:**
@@ -45,7 +45,7 @@
 - **Status**: ✅ FIXED
 
 **Mitigation:**
-- PyTorch 2.1.2+ patches this vulnerability
+- PyTorch 2.6.0 patches CVE-2024-50266 (RCE); CVE-2024-50267 and CVE-2024-50270 were patched in 2.2.0 — `torch>=2.6.0` covers all three
 - Resource cleanup prevents accumulation of unmanaged resources
 
 ---
@@ -93,7 +93,7 @@ pip install --upgrade -r requirements.txt
 ### 2. Verify PyTorch Version
 ```bash
 python -c "import torch; print(f'PyTorch: {torch.__version__}')"
-# Should output: PyTorch: 2.1.2 or higher
+# Should output: PyTorch: 2.6.0 or higher
 ```
 
 ### 3. Check for Unsafe torch.load() calls
@@ -132,9 +132,9 @@ grep -r "del model" experiment/  # Should show model deletion
 
 | Vulnerability | Impact | Risk After Fix |
 |:---|:---|:---|
-| RCE (torch.load) | Critical | Low - using >= 2.1.2 |
-| Resource Leak | Moderate | Low - explicit cleanup |
-| Local DoS | Low | Very Low - patched + cleanup |
+| RCE (torch.load) | Critical | Fixed — `torch>=2.6.0` |
+| Resource Leak | Moderate | Fixed — `torch>=2.2.0` (covered by 2.6.0 pin) |
+| Local DoS | Low | Fixed — `torch>=2.2.0` (covered by 2.6.0 pin) |
 
 **Overall Security Status**: ✅ **RESOLVED**
 
