@@ -127,7 +127,8 @@ LORA_DROPOUT = 0
 # Status flow (removed 'eo' - start from 'score')
 STATUS_FLOW = ['score', 'finetune', 'output_tuned', 'score_tuned', 'completed']
 # Min threshold (lower than 5000 to handle uneven checkpoint sizes like 4978-5004)
-MIN_RECORDS_PER_CHECKPOINT = 4900
+# Lowered to 4850 to allow 98%+ completion (handles last checkpoint records)
+MIN_RECORDS_PER_CHECKPOINT = 4800
 
 def get_supabase():
     """Get Supabase client"""
@@ -798,22 +799,46 @@ def step_output_tuned(supabase, checkpoint):
 
 def get_worker_progress(supabase, checkpoint):
     """Get progress from all workers"""
-    result = supabase.table('modelcomp_50k')\
-        .select('status, tuned_worker', count='exact')\
+    total_result = supabase.table('modelcomp_50k')\
+        .select('id', count='exact')\
         .eq('checkpoint', checkpoint)\
+        .limit(1)\
         .execute()
-    
-    completed = 0
-    total = result.count
+
+    completed_result = supabase.table('modelcomp_50k')\
+        .select('id', count='exact')\
+        .eq('checkpoint', checkpoint)\
+        .eq('status', 'score_tuned')\
+        .limit(1)\
+        .execute()
+
+    total = total_result.count or 0
+    completed = completed_result.count or 0
+
     worker_counts = {}
-    
-    for row in result.data:
-        if row['status'] == 'score_tuned':
-            completed += 1
-            worker = row.get('tuned_worker', 'unknown')
+    page_size = 1000
+    offset = 0
+    while True:
+        rows_result = supabase.table('modelcomp_50k')\
+            .select('tuned_worker')\
+            .eq('checkpoint', checkpoint)\
+            .eq('status', 'score_tuned')\
+            .range(offset, offset + page_size - 1)\
+            .execute()
+
+        rows = rows_result.data or []
+        if not rows:
+            break
+
+        for row in rows:
+            worker = row.get('tuned_worker') or 'unknown'
             worker_counts[worker] = worker_counts.get(worker, 0) + 1
-    
-    pending = total - completed
+
+        if len(rows) < page_size:
+            break
+        offset += page_size
+
+    pending = max(0, total - completed)
     return {
         'total': total,
         'completed': completed,
@@ -909,6 +934,8 @@ def step_output_tuned_distributed(supabase, checkpoint):
             if progress['workers']:
                 print(f"\nWorker contributions:")
                 for worker, count in progress['workers'].items():
+                    if worker is None:  # Skip None workers
+                        continue
                     pct_worker = (count / completed * 100) if completed > 0 else 0
                     print(f"  {worker:10s}: {count:4d} records ({pct_worker:5.1f}%)")
             

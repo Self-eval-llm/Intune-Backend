@@ -29,6 +29,12 @@ if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
+# Ensure logs are flushed immediately (prevents "looks stuck" behavior)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True, write_through=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True, write_through=True)
+
 load_dotenv()
 
 
@@ -49,8 +55,6 @@ os.environ['TORCHINDUCTOR_CPP_WRAPPER'] = '0'
 # Disable torch.compile/dynamo entirely on Windows (Triton incompatibility)
 os.environ['TORCHDYNAMO_DISABLE'] = '1'
 os.environ['TORCH_COMPILE_DISABLE'] = '1'
-
-from unsloth import FastLanguageModel
 
 # Config (match with main script)
 MAX_SEQ_LENGTH = 2048
@@ -89,43 +93,55 @@ def generate_output(model, tokenizer, instruction, context=""):
 
 def get_progress_stats(supabase, checkpoint):
     """Get progress statistics for all workers"""
-    result = supabase.table('modelcomp_50k')\
-        .select('status, tuned_worker', count='exact')\
+    total_result = supabase.table('modelcomp_50k')\
+        .select('id', count='exact')\
         .eq('checkpoint', checkpoint)\
+        .limit(1)\
         .execute()
-    
+
+    completed_result = supabase.table('modelcomp_50k')\
+        .select('id', count='exact')\
+        .eq('checkpoint', checkpoint)\
+        .eq('status', 'score_tuned')\
+        .limit(1)\
+        .execute()
+
     stats = {
-        'total': result.count,
-        'completed': 0,
+        'total': total_result.count or 0,
+        'completed': completed_result.count or 0,
         'pending': 0,
         'workers': {}
     }
-    
-    for row in result.data:
-        if row['status'] == 'score_tuned':
-            stats['completed'] += 1
-            worker = row.get('tuned_worker', 'unknown')
+
+    page_size = 1000
+    offset = 0
+    while True:
+        rows_result = supabase.table('modelcomp_50k')\
+            .select('tuned_worker')\
+            .eq('checkpoint', checkpoint)\
+            .eq('status', 'score_tuned')\
+            .range(offset, offset + page_size - 1)\
+            .execute()
+
+        rows = rows_result.data or []
+        if not rows:
+            break
+
+        for row in rows:
+            worker = row.get('tuned_worker') or 'unknown'
             stats['workers'][worker] = stats['workers'].get(worker, 0) + 1
-        else:
-            stats['pending'] += 1
-    
+
+        if len(rows) < page_size:
+            break
+        offset += page_size
+
+    stats['pending'] = max(0, stats['total'] - stats['completed'])
     return stats
 
 def get_other_workers(supabase, checkpoint, exclude_worker_id):
     """Get list of active workers"""
-    result = supabase.table('modelcomp_50k')\
-        .select('tuned_worker')\
-        .eq('checkpoint', checkpoint)\
-        .neq('tuned_worker', None)\
-        .execute()
-    
-    workers = set()
-    for row in result.data:
-        worker = row.get('tuned_worker')
-        if worker and worker != exclude_worker_id:
-            workers.add(worker)
-    
-    return list(workers)
+    stats = get_progress_stats(supabase, checkpoint)
+    return [w for w in stats['workers'].keys() if w != 'unknown' and w != exclude_worker_id]
 
 def estimate_completion_time(checkpoint, worker_id, batch_num, avg_time_per_record, pending_records):
     """Estimate time to completion"""
@@ -142,22 +158,29 @@ def estimate_completion_time(checkpoint, worker_id, batch_num, avg_time_per_reco
 def worker_loop(checkpoint, worker_id, batch_size=10):
     """Main worker loop - continuously fetch and process batches"""
     print(f"\n{'='*70}")
-    print(f"DISTRIBUTED WORKER: {worker_id}")
-    print(f"Checkpoint: {checkpoint}")
-    print(f"Batch size: {batch_size}")
-    print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"🚀 DISTRIBUTED WORKER: {worker_id}")
+    print(f"   Checkpoint: {checkpoint}")
+    print(f"   Batch size: {batch_size}")
+    print(f"   Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*70}\n")
     
+    print(f"[1/4] Connecting to Supabase...")
     supabase = get_supabase()
+    print(f"✅ Supabase connected")
     
     # Load model once
     model_path = f"models/gemma-ckpt{checkpoint}-lora"
     
     if not os.path.exists(model_path):
-        print(f"ERROR: Model not found at {model_path}")
+        print(f"❌ ERROR: Model not found at {model_path}")
         return False
     
-    print(f"Loading model from {model_path}...")
+    print(f"\n[2/5] Importing Unsloth...")
+    from unsloth import FastLanguageModel
+    print(f"✅ Unsloth imported")
+
+    print(f"[3/5] Loading model from {model_path}...")
+    print(f"      (This may take 30-60 seconds on first load)")
     try:
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=model_path,
@@ -165,16 +188,21 @@ def worker_loop(checkpoint, worker_id, batch_size=10):
             dtype=None,
             load_in_4bit=True,
         )
+        print(f"✅ Model weights loaded")
+        
+        print(f"[4/5] Preparing for inference...")
         FastLanguageModel.for_inference(model)
         device = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'
-        print(f"Model loaded on: {device}")
+        print(f"✅ Model inference ready on: {device}")
     except Exception as e:
-        print(f"Error loading model: {e}")
+        print(f"❌ Error loading model: {e}")
         return False
     finally:
         # Ensure GPU memory is cleared on any error
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    
+    print(f"[5/5] Starting batch processing loop...\n")
     
     total_generated = 0
     batch_count = 0
@@ -306,6 +334,16 @@ def worker_loop(checkpoint, worker_id, batch_size=10):
     return True
 
 def main():
+    print("\n" + "="*70)
+    print("🚀 DISTRIBUTED WORKER STARTUP")
+    print("="*70)
+    print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Python: {sys.version.split()[0]}")
+    print(f"PyTorch: {torch.__version__ if hasattr(torch, '__version__') else 'unknown'}")
+    print(f"GPU Available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    
     parser = argparse.ArgumentParser(description='Distributed Worker for Inference')
     parser.add_argument('--checkpoint', type=int, required=True, help='Checkpoint number')
     parser.add_argument('--worker-id', type=str, required=True, help='Worker ID (e.g., mac-1, rtx-1)')
