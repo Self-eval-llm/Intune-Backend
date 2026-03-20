@@ -23,12 +23,12 @@ Columns used:
   Before Finetuning (base student):
   - score, structured_correctness, task_success, instruction_following
   - coverage, faithfulness, hallucination, context_grounding, conciseness
-  - rouge1, rougeL, bleu
+  - rouge1, rougel, bleu
   
   After Finetuning (tuned student):
   - score_tuned, structured_correctness_tuned, task_success_tuned, instruction_following_tuned
   - coverage_tuned, faithfulness_tuned, hallucination_tuned, context_grounding_tuned, conciseness_tuned
-  - rouge1_tuned, rougeL_tuned, bleu_tuned
+  - rouge1_tuned, rougel_tuned, bleu_tuned
   
   Improvement:
   - improvement (score_tuned - score)
@@ -94,24 +94,48 @@ LORA_DROPOUT = 0
 
 # Status flow (removed 'eo' - start from 'score')
 STATUS_FLOW = ['score', 'finetune', 'output_tuned', 'score_tuned', 'completed']
-MIN_RECORDS_PER_CHECKPOINT = 5000
+# Min threshold (lower than 5000 to handle uneven checkpoint sizes like 4978-5004)
+MIN_RECORDS_PER_CHECKPOINT = 4900
 
 def get_supabase():
     """Get Supabase client"""
     return create_client(os.getenv('SUPABASE_URL'), os.getenv('SUPABASE_KEY'))
 
+def get_checkpoint_size(supabase, checkpoint):
+    """Get actual number of records in a checkpoint (may not be exactly 5000)"""
+    result = supabase.table('modelcomp_50k')\
+        .select('id', count='exact')\
+        .eq('checkpoint', checkpoint)\
+        .execute()
+    return result.count
+
 def fetch_records_by_status(supabase, checkpoint, status):
-    """Fetch records for a checkpoint with specific status"""
+    """Fetch records for a checkpoint with specific status (with pagination for >1000 records)"""
     print(f"\nFetching checkpoint {checkpoint} records with status='{status}'...")
     
-    result = supabase.table('modelcomp_50k')\
-        .select('*')\
-        .eq('checkpoint', checkpoint)\
-        .eq('status', status)\
-        .execute()
+    all_records = []
+    offset = 0
+    batch_size = 1000
     
-    print(f"Fetched {len(result.data)} records")
-    return result.data
+    while True:
+        result = supabase.table('modelcomp_50k')\
+            .select('*')\
+            .eq('checkpoint', checkpoint)\
+            .eq('status', status)\
+            .range(offset, offset + batch_size - 1)\
+            .execute()
+        
+        if not result.data:
+            break
+        
+        all_records.extend(result.data)
+        offset += batch_size
+        
+        if len(result.data) < batch_size:
+            break
+    
+    print(f"Fetched {len(all_records)} records")
+    return all_records
 
 def validate_records_count(records, step_name, min_required=MIN_RECORDS_PER_CHECKPOINT):
     """Validate that we have minimum required records for a step.
@@ -160,13 +184,28 @@ def fetch_checkpoint_records(supabase, checkpoint):
     return result.data
 
 def update_status(supabase, record_ids, new_status):
-    """Update status for multiple records"""
+    """Update status for multiple records with retry logic"""
     print(f"\nUpdating {len(record_ids)} records to status='{new_status}'...")
     
-    for rid in tqdm(record_ids, desc="Updating status"):
-        supabase.table('modelcomp_50k').update({
-            'status': new_status
-        }).eq('id', rid).execute()
+    import time
+    for i, rid in enumerate(tqdm(record_ids, desc="Updating status")):
+        retries = 3
+        while retries > 0:
+            try:
+                supabase.table('modelcomp_50k').update({
+                    'status': new_status
+                }).eq('id', rid).execute()
+                break
+            except Exception as e:
+                retries -= 1
+                if retries == 0:
+                    print(f"\n⚠️ Failed to update record {rid}: {e}")
+                else:
+                    time.sleep(1)  # Wait before retry
+        
+        # Slow down to avoid rate limiting (every 100 records)
+        if (i + 1) % 100 == 0:
+            time.sleep(0.5)
 
 def calculate_metrics(prediction, reference, instruction="", context="", task_label="general_qa"):
     """
@@ -196,7 +235,7 @@ def calculate_metrics(prediction, reference, instruction="", context="", task_la
             'conciseness': 0.0,
             'rouge1': 0.0,
             'rouge2': 0.0,
-            'rougeL': 0.0,
+            'rougel': 0.0,
             'bleu': 0.0
         }
     
@@ -210,7 +249,7 @@ def calculate_metrics(prediction, reference, instruction="", context="", task_la
     )
     
     # Also calculate basic ROUGE/BLEU for backwards compatibility
-    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)  # ROUGE scorer uses uppercase L
     rouge_scores = scorer.score(reference, prediction)
     
     smooth = SmoothingFunction().method1
@@ -233,7 +272,7 @@ def calculate_metrics(prediction, reference, instruction="", context="", task_la
         # Basic metrics
         'rouge1': rouge_scores['rouge1'].fmeasure,
         'rouge2': rouge_scores['rouge2'].fmeasure,
-        'rougeL': rouge_scores['rougeL'].fmeasure,
+        'rougel': rouge_scores['rougeL'].fmeasure,  # API returns uppercase, store as lowercase
         'bleu': bleu,
         # Details
         'details': eval_result.get('details', {})
@@ -365,14 +404,29 @@ def init_checkpoint(supabase, checkpoint):
     print(f"🔧 INIT - Initialize Checkpoint {checkpoint}")
     print(f"{'='*60}")
     
-    # Fetch records with null/empty status
-    result = supabase.table('modelcomp_50k')\
-        .select('id, sevenb, student_output')\
-        .eq('checkpoint', checkpoint)\
-        .or_('status.is.null,status.eq.')\
-        .execute()
+    # Fetch records with null/empty status (paginate to get all, Supabase limits to 1000)
+    all_records = []
+    offset = 0
+    batch_size = 1000
     
-    records = result.data
+    while True:
+        result = supabase.table('modelcomp_50k')\
+            .select('id, sevenb, student_output')\
+            .eq('checkpoint', checkpoint)\
+            .or_('status.is.null,status.eq.')\
+            .range(offset, offset + batch_size - 1)\
+            .execute()
+        
+        if not result.data:
+            break
+        
+        all_records.extend(result.data)
+        offset += batch_size
+        
+        if len(result.data) < batch_size:
+            break
+    
+    records = all_records
     print(f"Found {len(records)} records without status")
     
     # Validate they have required data
@@ -395,20 +449,23 @@ def init_checkpoint(supabase, checkpoint):
     
     # Show readiness status
     count = len(valid_records)
-    remaining = max(0, MIN_RECORDS_PER_CHECKPOINT - count)
-    pct_ready = (count / MIN_RECORDS_PER_CHECKPOINT) * 100 if MIN_RECORDS_PER_CHECKPOINT > 0 else 0
+    total_in_checkpoint = get_checkpoint_size(supabase, checkpoint)
+    # Use actual checkpoint size as target (handles uneven checkpoints like 4978-5004)
+    required = max(MIN_RECORDS_PER_CHECKPOINT, total_in_checkpoint - missing_sevenb)
+    remaining = max(0, required - count)
+    pct_ready = (count / required) * 100 if required > 0 else 0
     
     print(f"\n{'─'*50}")
     print(f"📊 DATA READINESS FOR CHECKPOINT {checkpoint}")
     print(f"{'─'*50}")
-    print(f"   Records ready:     {count:,}")
-    print(f"   Records required:  {MIN_RECORDS_PER_CHECKPOINT:,}")
-    print(f"   Records remaining: {remaining:,}")
-    print(f"   Progress:          {pct_ready:.1f}%")
+    print(f"   Total in checkpoint: {total_in_checkpoint:,}")
+    print(f"   Records ready:      {count:,}")
+    print(f"   Records remaining:  {remaining:,}")
+    print(f"   Progress:           {pct_ready:.1f}%")
     
     # Visual progress bar
     bar_length = 40
-    filled = int(bar_length * count / MIN_RECORDS_PER_CHECKPOINT) if MIN_RECORDS_PER_CHECKPOINT > 0 else 0
+    filled = int(bar_length * pct_ready / 100) if required > 0 else 0
     bar = '█' * filled + '░' * (bar_length - filled)
     print(f"   [{bar}]")
     print(f"{'─'*50}")
@@ -421,7 +478,7 @@ def init_checkpoint(supabase, checkpoint):
         if count < MIN_RECORDS_PER_CHECKPOINT:
             print(f"\n⚠️  WARNING: Only {count:,} records initialized.")
             print(f"   Need {remaining:,} more records before running --step score")
-            print(f"   Pipeline will wait until {MIN_RECORDS_PER_CHECKPOINT:,} records are ready.")
+            print(f"   Generate more with: python experiment/11_gen_base_student.py --checkpoint {checkpoint}")
     else:
         print("❌ No valid records to initialize")
     
@@ -481,7 +538,7 @@ def step_score(supabase, checkpoint):
             update_data['context_grounding'] = round(metrics['context_grounding'], 4)
             update_data['conciseness'] = round(metrics['conciseness'], 4)
             update_data['rouge1'] = round(metrics['rouge1'], 4)
-            update_data['rougeL'] = round(metrics['rougeL'], 4)
+            update_data['rougel'] = round(metrics['rougel'], 4)
             update_data['bleu'] = round(metrics['bleu'], 4)
         
         supabase.table('modelcomp_50k').update(update_data).eq('id', item['id']).execute()
@@ -489,7 +546,6 @@ def step_score(supabase, checkpoint):
         if metrics:
             all_metrics.append(metrics)
     
-    # Print summary of all metrics
     if all_metrics:
         print(f"\n{'='*60}")
         print(f"📊 BASE STUDENT EVALUATION SUMMARY (Checkpoint {checkpoint})")
@@ -508,7 +564,7 @@ def step_score(supabase, checkpoint):
         print(f"   Conciseness:            {sum(m['conciseness'] for m in all_metrics)/len(all_metrics):.4f}")
         print(f"   ─────────────────────────────────────")
         print(f"   ROUGE-1:                {sum(m['rouge1'] for m in all_metrics)/len(all_metrics):.4f}")
-        print(f"   ROUGE-L:                {sum(m['rougeL'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   ROUGE-L:                {sum(m['rougel'] for m in all_metrics)/len(all_metrics):.4f}")
         print(f"   BLEU:                   {sum(m['bleu'] for m in all_metrics)/len(all_metrics):.4f}")
         print(f"{'='*60}")
     
@@ -747,7 +803,7 @@ def step_score_tuned(supabase, checkpoint):
             update_data['context_grounding_tuned'] = round(metrics['context_grounding'], 4)
             update_data['conciseness_tuned'] = round(metrics['conciseness'], 4)
             update_data['rouge1_tuned'] = round(metrics['rouge1'], 4)
-            update_data['rougeL_tuned'] = round(metrics['rougeL'], 4)
+            update_data['rougel_tuned'] = round(metrics['rougel'], 4)
             update_data['bleu_tuned'] = round(metrics['bleu'], 4)
         
         supabase.table('modelcomp_50k').update(update_data).eq('id', item['id']).execute()
@@ -774,7 +830,7 @@ def step_score_tuned(supabase, checkpoint):
         print(f"   Conciseness:            {sum(m['conciseness'] for m in all_metrics)/len(all_metrics):.4f}")
         print(f"   ─────────────────────────────────────")
         print(f"   ROUGE-1:                {sum(m['rouge1'] for m in all_metrics)/len(all_metrics):.4f}")
-        print(f"   ROUGE-L:                {sum(m['rougeL'] for m in all_metrics)/len(all_metrics):.4f}")
+        print(f"   ROUGE-L:                {sum(m['rougel'] for m in all_metrics)/len(all_metrics):.4f}")
         print(f"   BLEU:                   {sum(m['bleu'] for m in all_metrics)/len(all_metrics):.4f}")
         print(f"{'='*60}")
     
