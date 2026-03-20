@@ -23,6 +23,12 @@ from datetime import datetime, timedelta
 from supabase import create_client
 from dotenv import load_dotenv
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..'))
+
+def project_path(*parts):
+    return os.path.join(PROJECT_ROOT, *parts)
+
 # Fix Unicode/Emoji encoding on Windows
 if sys.platform == 'win32':
     import io
@@ -35,7 +41,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(line_buffering=True, write_through=True)
 
-load_dotenv()
+load_dotenv(project_path('.env'))
 
 
 # MEMORY OPTIMIZATION: Limit CPU usage for multiprocessing
@@ -169,7 +175,7 @@ def worker_loop(checkpoint, worker_id, batch_size=10):
     print(f"✅ Supabase connected")
     
     # Load model once
-    model_path = f"models/gemma-ckpt{checkpoint}-lora"
+    model_path = project_path('models', f"gemma-ckpt{checkpoint}-lora")
     
     if not os.path.exists(model_path):
         print(f"❌ ERROR: Model not found at {model_path}")

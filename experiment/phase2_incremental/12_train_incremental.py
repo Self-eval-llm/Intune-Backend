@@ -65,7 +65,14 @@ if sys.platform == 'win32':
 
 # Load .env before any other imports
 from dotenv import load_dotenv
-load_dotenv()
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..'))
+
+def project_path(*parts):
+    return os.path.join(PROJECT_ROOT, *parts)
+
+load_dotenv(project_path('.env'))
 
 # MEMORY OPTIMIZATION: Limit CPU usage for multiprocessing
 os.environ['OMP_NUM_THREADS'] = '2'
@@ -655,7 +662,7 @@ def step_finetune(supabase, checkpoint):
             random_state=42,
         )
     else:
-        prev_path = f"models/gemma-ckpt{checkpoint-1}-lora"
+        prev_path = project_path('models', f"gemma-ckpt{checkpoint-1}-lora")
         if os.path.exists(prev_path):
             print(f"\nLoading previous checkpoint from {prev_path}...")
             model, tokenizer = FastLanguageModel.from_pretrained(
@@ -685,7 +692,7 @@ def step_finetune(supabase, checkpoint):
             )
     
     # Train
-    output_dir = f"models/gemma-ckpt{checkpoint}-lora"
+    output_dir = project_path('models', f"gemma-ckpt{checkpoint}-lora")
     
     trainer = SFTTrainer(
         model=model,
@@ -758,7 +765,7 @@ def step_output_tuned(supabase, checkpoint):
         return 0
     
     # Load finetuned model
-    model_path = f"models/gemma-ckpt{checkpoint}-lora"
+    model_path = project_path('models', f"gemma-ckpt{checkpoint}-lora")
     if not os.path.exists(model_path):
         print(f"❌ Model not found: {model_path}")
         print("Run 'finetune' step first.")
@@ -876,7 +883,7 @@ def step_output_tuned_distributed(supabase, checkpoint):
     total_records = len(records)
     
     # Check model exists
-    model_path = f"models/gemma-ckpt{checkpoint}-lora"
+    model_path = project_path('models', f"gemma-ckpt{checkpoint}-lora")
     if not os.path.exists(model_path):
         print(f"ERROR: Model not found at {model_path}")
         return 0
@@ -1138,8 +1145,9 @@ def step_completed(supabase, checkpoint):
             'improvement_pct': pct_improvement
         }
         
-        os.makedirs('reports/incremental', exist_ok=True)
-        report_path = f"reports/incremental/checkpoint_{checkpoint}_report.json"
+        reports_dir = project_path('reports', 'incremental')
+        os.makedirs(reports_dir, exist_ok=True)
+        report_path = os.path.join(reports_dir, f"checkpoint_{checkpoint}_report.json")
         with open(report_path, 'w') as f:
             json.dump(report, f, indent=2)
         print(f"📄 Report saved: {report_path}")
