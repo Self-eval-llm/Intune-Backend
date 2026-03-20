@@ -382,3 +382,123 @@ DROP VIEW IF EXISTS v_metrics_comparison;
 -- 2. Check summary: SELECT * FROM v_checkpoint_summary;
 -- 3. Run pipeline: python experiment/12_train_incremental.py --checkpoint 1 --init
 -- ============================================================================
+
+-- ============================================================================
+-- EVENT-DRIVEN ARCHITECTURE TABLES
+-- ============================================================================
+-- The following tables support the Kafka + Spark migration from polling-based
+-- workers to event-driven trigger execution with idempotent guarantees.
+-- ============================================================================
+
+-- === NEW: pipeline_status_counts ===
+-- Purpose: Spark upserts live rolling counts here so dashboards and debug tools
+-- can read without querying raw data tables. Provides real-time visibility into
+-- checkpoint processing status distribution.
+CREATE TABLE IF NOT EXISTS pipeline_status_counts (
+    checkpoint     INTEGER NOT NULL,           -- Checkpoint number (1-10)
+    status         TEXT NOT NULL,              -- Status value (score, finetune, etc.)
+    count          BIGINT NOT NULL DEFAULT 0,  -- Live count of records with this status
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),  -- Last update timestamp
+    PRIMARY KEY (checkpoint, status)
+);
+
+-- Index for time-range queries (monitoring dashboards)
+CREATE INDEX IF NOT EXISTS idx_pipeline_status_counts_updated_at
+ON pipeline_status_counts(updated_at);
+
+COMMENT ON TABLE pipeline_status_counts IS
+'Live rolling counts per (checkpoint, status) maintained by Spark consumer for dashboard visibility';
+
+COMMENT ON COLUMN pipeline_status_counts.checkpoint IS
+'Checkpoint number (1-10) corresponding to modelcomp_50k.checkpoint';
+
+COMMENT ON COLUMN pipeline_status_counts.status IS
+'Status value matching modelcomp_50k.status (score, finetune, output_tuned, score_tuned, completed)';
+
+COMMENT ON COLUMN pipeline_status_counts.count IS
+'Live count of records with this checkpoint and status combination';
+
+COMMENT ON COLUMN pipeline_status_counts.updated_at IS
+'Timestamp of last count update by Spark streaming job';
+
+-- === NEW: pipeline_trigger_log ===
+-- Purpose: Exactly-once guard. Before executing any stage, the trigger consumer
+-- checks this table. If dedupe_key already exists, skip execution to prevent
+-- duplicate stage runs caused by Kafka redelivery or replay.
+CREATE TABLE IF NOT EXISTS pipeline_trigger_log (
+    trigger_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),  -- Unique trigger identifier
+    checkpoint     INTEGER NOT NULL,                            -- Checkpoint number
+    stage          TEXT NOT NULL,                               -- Stage name (finetune, output_tuned, etc.)
+    dedupe_key     TEXT NOT NULL,                               -- Deduplication key: "{checkpoint}_{stage}_5000"
+    fired_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),          -- Trigger execution timestamp
+    source_job     TEXT                                         -- Optional: job name that emitted trigger
+);
+
+-- Unique constraint for idempotent trigger execution
+ALTER TABLE pipeline_trigger_log
+ADD CONSTRAINT unique_dedupe_key UNIQUE (dedupe_key);
+
+-- Index for checkpoint + stage queries
+CREATE INDEX IF NOT EXISTS idx_pipeline_trigger_log_checkpoint_stage
+ON pipeline_trigger_log(checkpoint, stage);
+
+COMMENT ON TABLE pipeline_trigger_log IS
+'Audit log for trigger executions with deduplication guarantee via unique dedupe_key';
+
+COMMENT ON COLUMN pipeline_trigger_log.trigger_id IS
+'Unique identifier for each trigger event (UUID)';
+
+COMMENT ON COLUMN pipeline_trigger_log.checkpoint IS
+'Checkpoint number (1-10) for which this trigger was fired';
+
+COMMENT ON COLUMN pipeline_trigger_log.stage IS
+'Pipeline stage name (score, finetune, output_tuned, score_tuned, completed)';
+
+COMMENT ON COLUMN pipeline_trigger_log.dedupe_key IS
+'Deduplication key format: "{checkpoint}_{stage}_5000" ensures exactly-once execution';
+
+COMMENT ON COLUMN pipeline_trigger_log.fired_at IS
+'Timestamp when trigger was successfully logged and executed';
+
+COMMENT ON COLUMN pipeline_trigger_log.source_job IS
+'Optional identifier for the Spark job or service that emitted this trigger';
+
+-- === NEW: pipeline_consumed_events ===
+-- Purpose: Tracks which Kafka events have been fully processed, enabling replay
+-- safety. If the system crashes and Kafka rewinds to an earlier offset, already-
+-- processed events can be skipped by checking this table.
+CREATE TABLE IF NOT EXISTS pipeline_consumed_events (
+    event_id       UUID PRIMARY KEY,                    -- Unique event identifier from Kafka message
+    consumed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),  -- Event processing completion timestamp
+    consumer_name  TEXT NOT NULL                        -- Name of consumer that processed event
+);
+
+-- Index for time-range queries (cleanup old events)
+CREATE INDEX IF NOT EXISTS idx_pipeline_consumed_events_consumed_at
+ON pipeline_consumed_events(consumed_at);
+
+COMMENT ON TABLE pipeline_consumed_events IS
+'Tracks fully processed Kafka events for idempotent replay safety across consumer restarts';
+
+COMMENT ON COLUMN pipeline_consumed_events.event_id IS
+'UUID event identifier from Kafka message (matches event_id field in JSON payload)';
+
+COMMENT ON COLUMN pipeline_consumed_events.consumed_at IS
+'Timestamp when event processing completed successfully';
+
+COMMENT ON COLUMN pipeline_consumed_events.consumer_name IS
+'Identifier for the consumer service (e.g., "trigger_consumer", "spark_status_writer")';
+
+-- ============================================================================
+-- EVENT-DRIVEN MIGRATION COMPLETE
+-- ============================================================================
+-- Three new tables added:
+--   1. pipeline_status_counts     - Live rolling counts from Spark
+--   2. pipeline_trigger_log       - Exactly-once trigger execution log
+--   3. pipeline_consumed_events   - Kafka event deduplication for replay safety
+--
+-- Verification queries:
+-- SELECT * FROM pipeline_status_counts;
+-- SELECT * FROM pipeline_trigger_log ORDER BY fired_at DESC LIMIT 10;
+-- SELECT * FROM pipeline_consumed_events ORDER BY consumed_at DESC LIMIT 10;
+-- ============================================================================

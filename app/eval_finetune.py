@@ -1,7 +1,18 @@
 """
 Worker to handle fine-tuning and post-finetune evaluation.
-Checks for 5000 records with status_eval_first='done', runs finetune.py, 
-then evaluates with fine-tuned model.
+
+TRIGGER MODE:
+    The functions in this file are designed to be called by trigger_consumer.py
+    when the threshold of status_eval_first='done' records is reached (trigger event).
+
+    Event-driven workflow (NO POLLING):
+      1. prepare_training_data() - Fetch all records with status_eval_first='done'
+      2. run_finetune() - Execute finetune.py
+      3. evaluate_with_finetuned_model() - Evaluate ALL pending records in one pass
+
+MANUAL MODE (Legacy):
+    Can still be run directly for testing: python app/eval_finetune.py
+    This will execute the old polling behavior for backward compatibility.
 """
 import os
 import sys
@@ -112,16 +123,16 @@ def prepare_training_data():
 
 
 def run_finetune():
-    """Execute finetune.py"""
+    """Execute the real finetune.py script"""
     try:
         finetune_script = os.path.join(project_root, 'src', 'training', 'finetune.py')
-        
+
         if not os.path.exists(finetune_script):
             logger.error(f"Finetune script not found: {finetune_script}")
             return False
-        
-        logger.info("Starting fine-tuning process...")
-        
+
+        logger.info("Starting real fine-tuning process...")
+
         process = subprocess.Popen(
             [sys.executable, finetune_script],
             cwd=project_root,
@@ -151,22 +162,39 @@ def run_finetune():
 
 
 def load_finetuned_model():
-    """Load fine-tuned model for inference"""
+    """Load fine-tuned model for inference using transformers + PEFT (Python 3.9 compatible)"""
     try:
-        from unsloth import FastLanguageModel
-        
         model_path = os.path.join(project_root, 'models', 'gemma-finetuned-merged')
-        
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=model_path,
-            max_seq_length=2048,
-            dtype=None,
-            load_in_4bit=False
+
+        if not os.path.exists(model_path):
+            logger.error(f"Fine-tuned model not found: {model_path}")
+            logger.info("Please run finetuning first to create the model")
+            return None, None
+
+        # Use transformers instead of unsloth for Python 3.9 compatibility
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        import torch
+
+        logger.info(f"Loading fine-tuned model from {model_path}...")
+
+        # Load the merged model (no PEFT needed since it's already merged)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto" if torch.cuda.is_available() else "cpu",
+            trust_remote_code=True,
         )
-        
-        FastLanguageModel.for_inference(model)
+
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "right"
+
+        # Set to eval mode for inference
+        model.eval()
+
         logger.info(f"✓ Loaded fine-tuned model from {model_path}")
         return model, tokenizer
+
     except Exception as e:
         logger.error(f"Error loading model: {e}")
         return None, None
@@ -184,37 +212,58 @@ def format_context(context):
 def generate_with_finetuned(model, tokenizer, record):
     """Generate output using fine-tuned model"""
     try:
+        import torch
+
         question = record.get("input", "")
         context = format_context(record.get("context"))
-        
+
         instruction = "Answer the following question accurately and concisely based on the provided information."
-        
+
         if context:
             input_text = f"Context:\n{context}\n\nQuestion: {question}"
         else:
             input_text = f"Question: {question}"
-        
-        prompt = f"""<bos><start_of_turn>user
-{instruction}
 
-{input_text}<end_of_turn>
-<start_of_turn>model
-"""
-        
-        inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=512,
-            temperature=0.7,
-            top_p=0.9,
-            use_cache=True
-        )
-        
-        response = tokenizer.batch_decode(outputs)[0]
-        response = response.split("<start_of_turn>model\n")[-1].split("<end_of_turn>")[0].strip()
+        prompt = f"Human: {instruction}\n\n{input_text}\nAssistant:"
+
+        # Tokenize input
+        inputs = tokenizer([prompt], return_tensors="pt")
+
+        # Move to same device as model
+        if hasattr(model, 'device'):
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        elif torch.cuda.is_available():
+            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+
+        # Generate response
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=512,
+                temperature=0.7,
+                top_p=0.9,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                use_cache=True
+            )
+
+        # Decode response
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+        # Extract just the model's response (after "Assistant:")
+        if "Assistant:" in response:
+            response = response.split("Assistant:")[-1]
+        if "<|endoftext|>" in response:
+            response = response.split("<|endoftext|>")[0]
+
+        response = response.strip()
+
+        logger.debug(f"Generated response: {response[:100]}...")
         return response
+
     except Exception as e:
-        logger.error(f"Error generating output: {e}")
+        logger.error(f"Error generating response: {e}")
         return None
 
 
@@ -261,55 +310,65 @@ def update_finetuned_record(record_id, output, metrics):
 
 
 def evaluate_with_finetuned_model():
-    """Evaluate all pending records with fine-tuned model"""
+    """
+    Evaluate all pending records with fine-tuned model in ONE PASS (no polling).
+
+    TRIGGER MODE: Processes all records with status_eval_first='done'
+    and status_eval_final=null in batches until complete.
+    """
     logger.info("Starting post-finetune evaluation...")
-    
+
     model, tokenizer = load_finetuned_model()
     if model is None or tokenizer is None:
         logger.error("Cannot load model for evaluation")
         return False
-    
+
     try:
         supabase = get_supabase_client()
-        
+
+        total_processed = 0
+        batch_size = 5
+
         while True:
             # Fetch records needing final evaluation
             response = supabase.table("intune_db")\
                 .select("*")\
                 .eq("status_eval_first", "done")\
                 .is_("status_eval_final", "null")\
-                .limit(5)\
+                .limit(batch_size)\
                 .execute()
-            
+
             records = response.data
-            
+
             if not records:
-                logger.info("All records evaluated with fine-tuned model")
+                logger.info(f"All records evaluated with fine-tuned model (total: {total_processed})")
                 break
-            
-            logger.info(f"Evaluating {len(records)} records with fine-tuned model")
-            
+
+            logger.info(f"Evaluating batch of {len(records)} records...")
+
             for record in records:
                 record_id = record.get("id")
                 logger.info(f"Processing record {record_id}")
-                
+
                 output = generate_with_finetuned(model, tokenizer, record)
-                
+
                 if output:
                     metrics = compute_finetuned_metrics(record, output)
-                    
+
                     if metrics:
                         if update_finetuned_record(record_id, output, metrics):
                             logger.info(f"✓ Updated record {record_id}")
+                            total_processed += 1
                         else:
                             logger.error(f"✗ Failed to update record {record_id}")
                     else:
                         logger.error(f"✗ Failed to compute metrics for record {record_id}")
                 else:
                     logger.error(f"✗ Failed to generate output for record {record_id}")
-            
-            time.sleep(2)  # Small pause between batches
-        
+
+            # Small pause between batches
+            time.sleep(2)
+
         return True
     except Exception as e:
         logger.error(f"Error during evaluation: {e}")
@@ -317,25 +376,32 @@ def evaluate_with_finetuned_model():
 
 
 def main():
-    logger.info("Starting fine-tune worker...")
-    
+    """
+    MANUAL MODE: Legacy polling behavior for backward compatibility.
+
+    For production, use trigger_consumer.py which calls these functions
+    when Kafka trigger events arrive (event-driven, no polling).
+    """
+    logger.info("Starting fine-tune worker (MANUAL MODE)...")
+    logger.info("⚠️  For event-driven execution, use trigger_consumer.py")
+
     finetune_done = False
-    
+
     while True:
         try:
             if not finetune_done:
                 # Check if we should run fine-tuning
                 if check_finetune_conditions():
                     logger.info("🎯 Conditions met! Preparing training data...")
-                    
+
                     # Prepare training data from Supabase
                     if not prepare_training_data():
                         logger.error("Failed to prepare training data, retrying...")
                         time.sleep(300)
                         continue
-                    
+
                     logger.info("Starting fine-tuning...")
-                    
+
                     if run_finetune():
                         logger.info("✅ Fine-tuning completed")
                         finetune_done = True
@@ -348,18 +414,18 @@ def main():
             else:
                 # Fine-tuning done, now evaluate with fine-tuned model
                 logger.info("Starting final evaluation with fine-tuned model...")
-                
+
                 if evaluate_with_finetuned_model():
                     logger.info("🎉 All evaluations complete!")
                     break  # Exit after completing all evaluations
                 else:
                     logger.error("Evaluation incomplete, retrying...")
                     time.sleep(60)
-                    
+
         except Exception as e:
             logger.error(f"Error in worker loop: {e}")
             time.sleep(60)
-    
+
     logger.info("Worker finished")
 
 

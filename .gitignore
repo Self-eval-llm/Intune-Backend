@@ -49,3 +49,5 @@ tmp/
 # OS
 Thumbs.db
 .DS_Store
+
+intune_pipeline_env

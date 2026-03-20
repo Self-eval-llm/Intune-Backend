@@ -42,7 +42,7 @@ torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
 torch.backends.cuda.enable_math_sdp(True)
 
-from unsloth import FastLanguageModel
+# NOTE: No unsloth import here - we use transformers + PEFT for Python 3.9 compatibility
 
 # Configuration
 MAX_SEQ_LENGTH = 2048  # Max sequence length (can reduce if OOM)
@@ -53,20 +53,19 @@ LOAD_IN_4BIT = True  # 4-bit quantization for 1B model (optimized for 8GB VRAM)
 LORA_R = 16  # LoRA rank
 LORA_ALPHA = 32  # LoRA alpha
 LORA_DROPOUT = 0
-TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", 
-                  "gate_proj", "up_proj", "down_proj"]
+TARGET_MODULES = ["c_attn", "c_proj", "c_fc"]  # DialoGPT specific modules
 
-# Training Configuration
-BATCH_SIZE = 2  # Small batch for 8GB VRAM
-GRADIENT_ACCUMULATION_STEPS = 4  # Effective batch = 2 * 4 = 8
+# Training Configuration (CPU optimized)
+BATCH_SIZE = 1  # Small batch for CPU training
+GRADIENT_ACCUMULATION_STEPS = 8  # Higher accumulation for effective batch = 1 * 8 = 8
 LEARNING_RATE = 2e-4
-NUM_EPOCHS = 3
+NUM_EPOCHS = 1  # Single epoch for quick testing
 WARMUP_STEPS = 5
-LOGGING_STEPS = 10
-SAVE_STEPS = 100
+LOGGING_STEPS = 1
+SAVE_STEPS = 50
 
-# Model name
-MODEL_NAME = "unsloth/gemma-3-1b-it-unsloth-bnb-4bit"  # Gemma 3 1B Instruction-tuned (PyTorch format for fine-tuning)
+# Model name - using open model without access restrictions
+MODEL_NAME = "microsoft/DialoGPT-small"  # Small model for CPU compatibility, no restrictions
 
 
 def load_training_data():
@@ -104,19 +103,14 @@ def load_training_data():
 
 
 def format_prompt(sample):
-    """Format sample into instruction prompt for Gemma"""
+    """Format sample into instruction prompt for DialoGPT"""
     instruction = sample['instruction']
     input_text = sample['input']
     output_text = sample['output']
-    
-    # Gemma format with proper tokens
-    prompt = f"""<bos><start_of_turn>user
-{instruction}
 
-{input_text}<end_of_turn>
-<start_of_turn>model
-{output_text}<end_of_turn><eos>"""
-    
+    # Simple format for DialoGPT - just input and expected output
+    prompt = f"Human: {instruction}\n\n{input_text}\nAssistant: {output_text}<|endoftext|>"
+
     return prompt
 
 
@@ -138,36 +132,51 @@ def setup_model_and_tokenizer():
     print("\n" + "=" * 80)
     print("LOADING MODEL AND APPLYING LORA")
     print("=" * 80)
-    
+
     # Use standard transformers instead of Unsloth to avoid Triton requirements
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-    
-    # Configure 4-bit quantization
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True,
-    )
-    
-    # Load model without Unsloth optimizations
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        quantization_config=bnb_config,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from peft import LoraConfig, get_peft_model
+
+    # CPU-optimized model loading (no quantization for CPU)
+    if torch.cuda.is_available():
+        print("🎮 CUDA available - using GPU with quantization")
+        from transformers import BitsAndBytesConfig
+
+        # Configure 4-bit quantization for GPU
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+
+        # Prepare model for k-bit training
+        from peft import prepare_model_for_kbit_training
+        model = prepare_model_for_kbit_training(model)
+
+    else:
+        print("💻 CUDA not available - using CPU (slower but functional)")
+        # Load model for CPU without quantization
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            dtype=torch.float32,  # Use float32 for CPU
+            device_map={"": "cpu"},
+            trust_remote_code=True,
+        )
+
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
-    
+
     print("✓ Model loaded")
-    
-    # Prepare model for k-bit training
-    model = prepare_model_for_kbit_training(model)
-    
+
     # Apply LoRA using PEFT
     lora_config = LoraConfig(
         r=LORA_R,
@@ -177,14 +186,14 @@ def setup_model_and_tokenizer():
         bias="none",
         task_type="CAUSAL_LM",
     )
-    
+
     model = get_peft_model(model, lora_config)
-    
+
     print("✓ LoRA applied")
     print(f"  - Rank: {LORA_R}")
     print(f"  - Alpha: {LORA_ALPHA}")
     print(f"  - Dropout: {LORA_DROPOUT}")
-    
+
     return model, tokenizer
 
 
@@ -218,7 +227,7 @@ def train_model(model, tokenizer, dataset):
         # Disable any cross-entropy optimizations that require Triton
         model.config.use_cache = False
     
-    # Training arguments optimized for 8GB VRAM
+    # Training arguments optimized for CPU/GPU compatibility
     training_args = TrainingArguments(
         output_dir=checkpoint_dir,
         per_device_train_batch_size=BATCH_SIZE,
@@ -227,10 +236,10 @@ def train_model(model, tokenizer, dataset):
         warmup_steps=WARMUP_STEPS,
         num_train_epochs=NUM_EPOCHS,
         learning_rate=LEARNING_RATE,
-        fp16=not torch.cuda.is_bf16_supported(),
-        bf16=torch.cuda.is_bf16_supported(),
+        fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),  # Only use fp16 on GPU
+        bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),  # Only use bf16 on GPU
         logging_steps=LOGGING_STEPS,
-        optim="adamw_8bit",  # 8-bit optimizer to save memory
+        optim="adamw_torch" if not torch.cuda.is_available() else "adamw_8bit",  # Use standard optimizer for CPU
         weight_decay=0.01,
         lr_scheduler_type="cosine",
         seed=42,
@@ -266,14 +275,20 @@ def train_model(model, tokenizer, dataset):
         train_result = trainer.train()
     
     return trainer, train_result
-    
-    # Show GPU memory stats
-    gpu_stats = torch.cuda.get_device_properties(0)
-    start_gpu_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
-    max_memory = round(gpu_stats.total_memory / 1024 / 1024 / 1024, 3)
-    
-    print(f"\n🎮 GPU: {gpu_stats.name}")
-    print(f"💾 Memory: {start_gpu_memory} GB / {max_memory} GB allocated")
+
+def show_training_info(dataset):
+    """Show training configuration and hardware info"""
+    if torch.cuda.is_available():
+        # Show GPU memory stats
+        gpu_stats = torch.cuda.get_device_properties(0)
+        start_gpu_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
+        max_memory = round(gpu_stats.total_memory / 1024 / 1024 / 1024, 3)
+
+        print(f"\n🎮 GPU: {gpu_stats.name}")
+        print(f"💾 Memory: {start_gpu_memory} GB / {max_memory} GB allocated")
+    else:
+        print(f"\n💻 Using CPU for training")
+
     print(f"\n📊 Training configuration:")
     print(f"  - Batch size: {BATCH_SIZE}")
     print(f"  - Gradient accumulation: {GRADIENT_ACCUMULATION_STEPS}")
@@ -282,26 +297,10 @@ def train_model(model, tokenizer, dataset):
     print(f"  - Epochs: {NUM_EPOCHS}")
     print(f"  - Training samples: {len(dataset['train'])}")
     print(f"  - Validation samples: {len(dataset['validation'])}")
-    
+
     print("\n" + "=" * 80)
     print("🚀 TRAINING STARTED...")
     print("=" * 80 + "\n")
-    
-    # Train!
-    trainer_stats = trainer.train()
-    
-    # Show final GPU memory
-    used_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
-    used_memory_for_lora = round(used_memory - start_gpu_memory, 3)
-    used_percentage = round(used_memory / max_memory * 100, 3)
-    
-    print("\n" + "=" * 80)
-    print("✅ TRAINING COMPLETED!")
-    print("=" * 80)
-    print(f"\n💾 Peak memory usage: {used_memory} GB ({used_percentage}%)")
-    print(f"📈 Memory used for training: {used_memory_for_lora} GB")
-    
-    return trainer
 
 
 def save_model(model, tokenizer):
@@ -343,50 +342,55 @@ def test_model(model, tokenizer):
     print("\n" + "=" * 80)
     print("TESTING FINE-TUNED MODEL")
     print("=" * 80)
-    
+
     # Enable inference mode (standard PyTorch)
     model.eval()
-    
+
     # Test sample
     test_instruction = "Answer the following question accurately and concisely based on the provided information."
     test_input = "Question: What is machine learning?"
-    
-    prompt = f"""<bos><start_of_turn>user
-{test_instruction}
 
-{test_input}<end_of_turn>
-<start_of_turn>model
-"""
-    
-    inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
-    
+    prompt = f"Human: {test_instruction}\n\n{test_input}\nAssistant:"
+
+    # Use appropriate device (CPU or GPU)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    inputs = tokenizer([prompt], return_tensors="pt").to(device)
+
+    print(f"\n🖥️  Using device: {device}")
     print("\n📝 Test input:")
     print(f"  {test_input}")
     print("\n🤖 Model output:")
-    
+
     outputs = model.generate(
         **inputs,
         max_new_tokens=256,
         temperature=0.7,
         top_p=0.9,
+        do_sample=True,
+        pad_token_id=tokenizer.eos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
         use_cache=True
     )
-    
-    response = tokenizer.batch_decode(outputs)[0]
-    # Extract just the model's response
-    response = response.split("<start_of_turn>model\n")[-1].split("<end_of_turn>")[0]
+
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    # Extract just the model's response (after "Assistant:")
+    if "Assistant:" in response:
+        response = response.split("Assistant:")[-1]
+
+    response = response.strip()
+
     print(f"  {response}")
-    
     print("\n" + "=" * 80)
 
 
 def main():
     """Main fine-tuning pipeline"""
     print("=" * 80)
-    print("FINE-TUNING GEMMA 3:1B WITH UNSLOTH + LORA")
+    print("FINE-TUNING DIALOGPT WITH LORA")
     print("=" * 80)
-    print(f"\n🎯 Target: Gemma 3 1B (4-bit)")
-    print(f"💾 VRAM: Optimized for 8GB (RTX 4060)")
+    print(f"\n🎯 Target: DialoGPT-small (CPU Compatible)")
+    print(f"💻 CPU/GPU: Automatic detection")
     print(f"🔧 Method: LoRA (Low-Rank Adaptation)")
     
     # Load datasets
@@ -402,7 +406,7 @@ def main():
     
     # Setup model and tokenizer FIRST
     model, tokenizer = setup_model_and_tokenizer()
-    
+
     # Tokenize dataset for standard Trainer (after tokenizer is available)
     print("\nTokenizing dataset...")
     def tokenize_function(examples):
@@ -412,14 +416,17 @@ def main():
             max_length=MAX_SEQ_LENGTH,
             padding="max_length",
         )
-    
+
     dataset = dataset.map(
         tokenize_function,
         batched=True,
         num_proc=1,
         remove_columns=["instruction", "input", "output", "text"]
     )
-    
+
+    # Show training info before starting
+    show_training_info(dataset)
+
     # Train
     trainer, train_result = train_model(model, tokenizer, dataset)
     
@@ -440,12 +447,17 @@ def main():
 
 
 if __name__ == "__main__":
-    # Ensure CUDA is available before starting
-    if not torch.cuda.is_available():
-        print("❌ ERROR: CUDA is not available. Please check your GPU setup.")
-        sys.exit(1)
-    
-    # Clear CUDA cache before starting
-    torch.cuda.empty_cache()
-    
+    # Show hardware info
+    if torch.cuda.is_available():
+        print("🎮 CUDA is available - using GPU acceleration")
+        gpu_stats = torch.cuda.get_device_properties(0)
+        print(f"   GPU: {gpu_stats.name}")
+        print(f"   Memory: {round(gpu_stats.total_memory / 1024 / 1024 / 1024, 3)} GB")
+    else:
+        print("💻 CUDA not available - using CPU (training will be slower but functional)")
+
+    # Clear CUDA cache before starting (if available)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     main()
