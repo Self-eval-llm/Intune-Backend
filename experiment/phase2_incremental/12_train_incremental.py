@@ -56,13 +56,40 @@ import sys
 import json
 import time
 import argparse
+
+# Fix Unicode/Emoji encoding on Windows
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+# Load .env before any other imports
+from dotenv import load_dotenv
+load_dotenv()
+
+# MEMORY OPTIMIZATION: Limit CPU usage for multiprocessing
+os.environ['OMP_NUM_THREADS'] = '2'
+os.environ['OPENBLAS_NUM_THREADS'] = '2'
+os.environ['MKL_NUM_THREADS'] = '2'
+os.environ['VECLIB_MAXIMUM_THREADS'] = '2'
+os.environ['NUMEXPR_NUM_THREADS'] = '2'
+# Limit datasets library to 2 workers
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+# CRITICAL: Disable torch.compile() which fails on Windows
+os.environ['TORCH_COMPILE_DEBUG'] = '1'
+os.environ['DISABLE_UNSLOTH_AUTOIMPORT'] = '1'
+# Windows-specific fixes for torch inductor
+os.environ['INDUCTOR_NOBUILD'] = '1'
+os.environ['TORCHINDUCTOR_CPP_WRAPPER'] = '0'
+# Disable torch.compile/dynamo entirely on Windows (Triton incompatibility)
+os.environ['TORCHDYNAMO_DISABLE'] = '1'
+os.environ['TORCH_COMPILE_DISABLE'] = '1'
+
+# Import other modules
 import torch
 from tqdm import tqdm
-from datetime import datetime
+from datetime import datetime, timedelta
 from supabase import create_client
-from dotenv import load_dotenv
-
-load_dotenv()
 
 # Training imports
 from unsloth import FastLanguageModel
@@ -70,9 +97,14 @@ from trl import SFTTrainer
 from transformers import TrainingArguments
 from datasets import Dataset
 
+# Disable torch.compile for Windows compatibility
+torch._dynamo.config.disable = True          # ← ADD THIS
+torch._dynamo.config.suppress_errors = True
+torch._inductor.config.cpp_wrapper = False
+
 # Evaluation imports - use comprehensive metrics from 06_eval_metrics
 import sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'evaluation'))
 from importlib import import_module
 eval_metrics = import_module('06_eval_metrics')
 evaluate_single_output = eval_metrics.evaluate_single_output
@@ -660,12 +692,12 @@ def step_finetune(supabase, checkpoint):
         train_dataset=dataset,
         dataset_text_field="text",
         max_seq_length=MAX_SEQ_LENGTH,
-        dataset_num_proc=2,
+        dataset_num_proc=1,  # CRITICAL: Use 1 to prevent OOM during tokenization
         packing=False,
         args=TrainingArguments(
-            per_device_train_batch_size=4,
-            gradient_accumulation_steps=4,
-            warmup_steps=50,
+            per_device_train_batch_size=2,  # Reduced from 4 to reduce memory
+            gradient_accumulation_steps=8,  # Increased to maintain effective batch size
+            warmup_steps=30,
             num_train_epochs=1,
             learning_rate=2e-4,
             fp16=not torch.cuda.is_bf16_supported(),
@@ -677,9 +709,19 @@ def step_finetune(supabase, checkpoint):
             seed=42,
             output_dir=output_dir,
             save_strategy="epoch",
+            # Memory optimization flags
+            gradient_checkpointing=True,
+            remove_unused_columns=False,
+            ddp_find_unused_parameters=False,
+            # Windows-specific: Disable torch.compile
+            torch_compile=False,
+            torch_compile_backend='inductor',
         ),
     )
-    
+    # Ensure dynamo is disabled before training (Unsloth may re-enable it)
+    torch._dynamo.config.disable = True
+    torch.compiler.disable()   # belt-and-suspenders for torch 2.7+
+
     trainer.train()
     
     # Save
@@ -748,6 +790,171 @@ def step_output_tuned(supabase, checkpoint):
     print(f"✅ Status updated to 'score_tuned' - ready for final scoring")
     
     return len(records)
+
+def get_worker_progress(supabase, checkpoint):
+    """Get progress from all workers"""
+    result = supabase.table('modelcomp_50k')\
+        .select('status, tuned_worker', count='exact')\
+        .eq('checkpoint', checkpoint)\
+        .execute()
+    
+    completed = 0
+    total = result.count
+    worker_counts = {}
+    
+    for row in result.data:
+        if row['status'] == 'score_tuned':
+            completed += 1
+            worker = row.get('tuned_worker', 'unknown')
+            worker_counts[worker] = worker_counts.get(worker, 0) + 1
+    
+    pending = total - completed
+    return {
+        'total': total,
+        'completed': completed,
+        'pending': pending,
+        'workers': worker_counts,
+        'progress_pct': (completed / total * 100) if total > 0 else 0
+    }
+
+def estimate_time_remaining(checkpoint, total_records, completed, avg_time_per_record=2.0):
+    """Estimate time remaining assuming 2 parallel workers"""
+    if completed >= total_records:
+        return None, None
+    
+    pending = total_records - completed
+    # With 2 workers in parallel, divide by 2
+    effective_pending = pending / 2
+    remaining_seconds = effective_pending * avg_time_per_record
+    completion_time = datetime.now() + timedelta(seconds=remaining_seconds)
+    
+    return completion_time, remaining_seconds
+
+def step_output_tuned_distributed(supabase, checkpoint):
+    """Generate student_output_tuned using distributed workers on multiple machines"""
+    print(f"\n{'='*70}")
+    print(f"🤖 STEP: output_tuned - Generate Tuned Output (Distributed)")
+    print(f"   Checkpoint {checkpoint}")
+    print(f"{'='*70}")
+    
+    records = fetch_records_by_status(supabase, checkpoint, 'output_tuned')
+    
+    # Validate minimum records
+    if not validate_records_count(records, 'output_tuned'):
+        return 0
+    
+    total_records = len(records)
+    
+    # Check model exists
+    model_path = f"models/gemma-ckpt{checkpoint}-lora"
+    if not os.path.exists(model_path):
+        print(f"ERROR: Model not found at {model_path}")
+        return 0
+    
+    print(f"\n{'='*70}")
+    print(f"DISTRIBUTED INFERENCE INSTRUCTIONS")
+    print(f"{'='*70}")
+    print(f"\nTotal records to process: {total_records}")
+    print(f"\nRun workers on different machines:")
+    print(f"\n  MACBOOK PRO:")
+    print(f"    python 13_distributed_worker.py --checkpoint {checkpoint} --worker-id mac-1")
+    print(f"\n  WINDOWS RTX (optional parallel worker):")
+    print(f"    python 13_distributed_worker.py --checkpoint {checkpoint} --worker-id rtx-1")
+    print(f"\n  Both workers will coordinate via Supabase and process in parallel.")
+    print(f"\n{'='*70}\n")
+    
+    # Track progress loop
+    start_time = datetime.now()
+    check_interval = 10  # seconds between progress checks
+    last_completed = 0
+    record_times = []
+    
+    try:
+        while True:
+            progress = get_worker_progress(supabase, checkpoint)
+            completed = progress['completed']
+            pending = progress['pending']
+            pct = progress['progress_pct']
+            
+            # Calculate speed from actual data
+            elapsed = (datetime.now() - start_time).total_seconds()
+            if elapsed > 0 and completed > 0:
+                avg_time_per_record = elapsed / completed
+            else:
+                avg_time_per_record = 2.0  # default estimate
+            
+            # Estimate completion
+            completion_info = estimate_time_remaining(checkpoint, total_records, completed, avg_time_per_record)
+            completion_time, remaining_sec = completion_info if completion_info[0] else (None, None)
+            
+            # Progress dashboard
+            print(f"\n{'─'*70}")
+            print(f"PROGRESS UPDATE - {datetime.now().strftime('%H:%M:%S')}")
+            print(f"{'─'*70}")
+            print(f"Completed: {completed:4d} / {total_records:4d} ({pct:5.1f}%)")
+            print(f"Pending:   {pending:4d}")
+            
+            # Visual progress bar
+            bar_length = 50
+            filled = int(bar_length * pct / 100)
+            bar = 'x' * filled + '.' * (bar_length - filled)
+            print(f"[{bar}]")
+            
+            # Worker stats
+            if progress['workers']:
+                print(f"\nWorker contributions:")
+                for worker, count in progress['workers'].items():
+                    pct_worker = (count / completed * 100) if completed > 0 else 0
+                    print(f"  {worker:10s}: {count:4d} records ({pct_worker:5.1f}%)")
+            
+            # Time estimates
+            if avg_time_per_record > 0:
+                print(f"\nAvg time per record: {avg_time_per_record:.2f}s")
+            if completion_time and remaining_sec:
+                hours = int(remaining_sec // 3600)
+                mins = int((remaining_sec % 3600) // 60)
+                secs = int(remaining_sec % 60)
+                if hours > 0:
+                    time_str = f"{hours}h {mins}m {secs}s"
+                elif mins > 0:
+                    time_str = f"{mins}m {secs}s"
+                else:
+                    time_str = f"{secs}s"
+                print(f"Est. completion: {completion_time.strftime('%H:%M:%S')} ({time_str} remaining)")
+            
+            print(f"{'─'*70}")
+            
+            # Check if done
+            if pending == 0 and completed == total_records:
+                print(f"\n✅ All {total_records} records generated!")
+                break
+            
+            # Wait before next check
+            if pending > 0:
+                time.sleep(check_interval)
+            else:
+                time.sleep(5)
+    
+    except KeyboardInterrupt:
+        print(f"\n\nMonitoring stopped. Workers are still processing...")
+        progress = get_worker_progress(supabase, checkpoint)
+        print(f"Current progress: {progress['completed']} / {total_records}")
+    
+    # Final update
+    final_progress = get_worker_progress(supabase, checkpoint)
+    remaining = supabase.table('modelcomp_50k')\
+        .select('id', count='exact')\
+        .eq('checkpoint', checkpoint)\
+        .eq('status', 'output_tuned')\
+        .execute()
+    
+    if remaining.count == 0:
+        print(f"\n✅ All outputs generated!")
+        print(f"✅ Status: {final_progress['completed']} / {total_records} ready for scoring")
+        return final_progress['completed']
+    else:
+        print(f"\nNote: {remaining.count} records still pending")
+        return final_progress['completed']
 
 # =============================================================================
 # STEP 5: score_tuned - Score Tuned Student Output
@@ -1003,7 +1210,7 @@ def main():
     elif step == 'finetune':
         step_finetune(supabase, checkpoint)
     elif step == 'output_tuned':
-        step_output_tuned(supabase, checkpoint)
+        step_output_tuned_distributed(supabase, checkpoint)
     elif step == 'score_tuned':
         step_score_tuned(supabase, checkpoint)
     elif step == 'completed':

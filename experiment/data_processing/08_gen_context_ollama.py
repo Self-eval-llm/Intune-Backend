@@ -47,12 +47,16 @@ def fetch_null_context_records(supabase, limit=None, offset=0):
 
 
 def count_null_context(supabase):
-    """Count total NULL context records"""
-    result = supabase.table("modelcomp_50k")\
-        .select("id", count="exact")\
-        .is_("context", "null")\
-        .execute()
-    return result.count
+    """Count total NULL context records (estimated, faster than exact)"""
+    try:
+        result = supabase.table("modelcomp_50k")\
+            .select("id", count="estimated")\
+            .is_("context", "null")\
+            .execute()
+        return result.count if result.count else 0
+    except Exception as e:
+        print(f"Note: Count may be approximate due to large dataset")
+        return 30000  # Approximate for progress display
 
 
 def extract_key_concepts(text):
@@ -87,11 +91,18 @@ def derive_context_from_teacher(instruction, teacher_output, task_label):
     Context provides background info extracted from teacher's answer.
     """
 
-    if not teacher_output or len(teacher_output.strip()) < 10:
+    if not teacher_output:
+        return None
+
+    teacher_clean = teacher_output.strip()
+
+    # For very short outputs, just use them directly
+    if len(teacher_clean) < 20:
+        if len(teacher_clean) > 5:
+            return f"Teacher answer: {teacher_clean}"
         return None
 
     label = (task_label or "general").lower()
-    teacher_clean = teacher_output.strip()
 
     # Extract key sentences from teacher output
     key_concepts = extract_key_concepts(teacher_output)
@@ -107,7 +118,6 @@ def derive_context_from_teacher(instruction, teacher_output, task_label):
         if sentences:
             context = "Technical approach: " + " ".join(sentences[:2])
         else:
-            # Use first part of teacher output as hint
             context = f"Teacher guidance: {teacher_clean[:150]}"
 
     elif "math" in label or "logic" in label:
@@ -147,7 +157,7 @@ def derive_context_from_teacher(instruction, teacher_output, task_label):
     context = re.sub(r'\s+', ' ', context)
 
     # Ensure reasonable length
-    if len(context) < 20:
+    if len(context) < 15:
         return None
     if len(context) > 500:
         context = context[:497] + "..."
@@ -218,7 +228,7 @@ def main():
         while offset < to_process:
             # Fetch batch
             batch_limit = min(args.batch_size, to_process - offset)
-            records = fetch_null_context_records(supabase, limit=batch_limit, offset=0)
+            records = fetch_null_context_records(supabase, limit=batch_limit, offset=offset)
 
             if not records:
                 break
