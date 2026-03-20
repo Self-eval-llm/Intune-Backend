@@ -171,6 +171,10 @@ def worker_loop(checkpoint, worker_id, batch_size=10):
     except Exception as e:
         print(f"Error loading model: {e}")
         return False
+    finally:
+        # Ensure GPU memory is cleared on any error
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     total_generated = 0
     batch_count = 0
@@ -293,6 +297,11 @@ def worker_loop(checkpoint, worker_id, batch_size=10):
     except Exception as e:
         print(f"\nFatal error: {e}")
         return False
+    finally:
+        # SECURITY FIX: Always cleanup GPU memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        del model, tokenizer
     
     return True
 

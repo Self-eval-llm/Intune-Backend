@@ -729,6 +729,11 @@ def step_finetune(supabase, checkpoint):
     tokenizer.save_pretrained(output_dir)
     print(f"✅ Model saved to {output_dir}")
     
+    # SECURITY FIX: Properly release GPU memory after training
+    del model, trainer
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     # Update status
     record_ids = [r['id'] for r in records]
     update_status(supabase, record_ids, 'output_tuned')

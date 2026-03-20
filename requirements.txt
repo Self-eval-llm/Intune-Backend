@@ -10,7 +10,7 @@ python-dotenv>=1.0.0         # Environment variable management
 
 # ML/AI Dependencies
 # ------------------
-torch>=2.0.0,<2.5.0         # PyTorch for ML models
+torch>=2.1.2                # PyTorch for ML models (CVE-2024-50266, CVE-2024-50267, CVE-2024-50270 patched)
 transformers>=4.30.0         # HuggingFace transformers
 datasets>=2.14.0            # HuggingFace datasets
 accelerate>=0.20.0           # Training acceleration
