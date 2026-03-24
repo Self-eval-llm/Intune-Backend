@@ -17,17 +17,17 @@ Exit Codes:
 
 Usage:
     # Validate all statuses for intune_db
-    python pipeline_validator.py
+    python event_driven_pipeline/pipeline_validator.py
 
     # Validate specific status
-    python pipeline_validator.py --status done
+    python event_driven_pipeline/pipeline_validator.py --status done
 
 Scheduling (Recommended):
     Run via cron every 5 minutes during shadow mode:
 
     */5 * * * * cd /path/to/project && \
                 source venv/bin/activate && \
-                python pipeline_validator.py || \
+                python event_driven_pipeline/pipeline_validator.py || \
                 curl -X POST https://hooks.slack.com/... \
                      -d '{"text":"intune_db count mismatch detected!"}'
 
@@ -46,7 +46,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Add project root to path
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__)))
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 

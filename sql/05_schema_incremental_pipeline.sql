@@ -84,13 +84,13 @@ ALTER TABLE modelcomp_50k
 ADD COLUMN IF NOT EXISTS conciseness FLOAT DEFAULT NULL;
 
 -- Traditional NLP metrics
-ALTER TABLE modelcomp_50k 
+ALTER TABLE modelcomp_50k
 ADD COLUMN IF NOT EXISTS rouge1 FLOAT DEFAULT NULL;
 
-ALTER TABLE modelcomp_50k 
-ADD COLUMN IF NOT EXISTS rougeL FLOAT DEFAULT NULL;
+ALTER TABLE modelcomp_50k
+ADD COLUMN IF NOT EXISTS rougel FLOAT DEFAULT NULL;
 
-ALTER TABLE modelcomp_50k 
+ALTER TABLE modelcomp_50k
 ADD COLUMN IF NOT EXISTS bleu FLOAT DEFAULT NULL;
 
 -- Add comments for base metrics
@@ -124,7 +124,7 @@ COMMENT ON COLUMN modelcomp_50k.conciseness IS
 COMMENT ON COLUMN modelcomp_50k.rouge1 IS 
 'ROUGE-1 F1 score (0-1)';
 
-COMMENT ON COLUMN modelcomp_50k.rougeL IS 
+COMMENT ON COLUMN modelcomp_50k.rougel IS
 'ROUGE-L F1 score (0-1)';
 
 COMMENT ON COLUMN modelcomp_50k.bleu IS 
@@ -165,13 +165,13 @@ ALTER TABLE modelcomp_50k
 ADD COLUMN IF NOT EXISTS conciseness_tuned FLOAT DEFAULT NULL;
 
 -- Traditional NLP metrics (tuned)
-ALTER TABLE modelcomp_50k 
+ALTER TABLE modelcomp_50k
 ADD COLUMN IF NOT EXISTS rouge1_tuned FLOAT DEFAULT NULL;
 
-ALTER TABLE modelcomp_50k 
-ADD COLUMN IF NOT EXISTS rougeL_tuned FLOAT DEFAULT NULL;
+ALTER TABLE modelcomp_50k
+ADD COLUMN IF NOT EXISTS rougel_tuned FLOAT DEFAULT NULL;
 
-ALTER TABLE modelcomp_50k 
+ALTER TABLE modelcomp_50k
 ADD COLUMN IF NOT EXISTS bleu_tuned FLOAT DEFAULT NULL;
 
 -- Add comments for tuned metrics
@@ -205,7 +205,7 @@ COMMENT ON COLUMN modelcomp_50k.conciseness_tuned IS
 COMMENT ON COLUMN modelcomp_50k.rouge1_tuned IS 
 'ROUGE-1 F1 after finetuning (0-1)';
 
-COMMENT ON COLUMN modelcomp_50k.rougeL_tuned IS 
+COMMENT ON COLUMN modelcomp_50k.rougel_tuned IS
 'ROUGE-L F1 after finetuning (0-1)';
 
 COMMENT ON COLUMN modelcomp_50k.bleu_tuned IS 
@@ -344,7 +344,7 @@ ALTER TABLE modelcomp_50k DROP COLUMN IF EXISTS hallucination;
 ALTER TABLE modelcomp_50k DROP COLUMN IF EXISTS context_grounding;
 ALTER TABLE modelcomp_50k DROP COLUMN IF EXISTS conciseness;
 ALTER TABLE modelcomp_50k DROP COLUMN IF EXISTS rouge1;
-ALTER TABLE modelcomp_50k DROP COLUMN IF EXISTS rougeL;
+ALTER TABLE modelcomp_50k DROP COLUMN IF EXISTS rougel;
 ALTER TABLE modelcomp_50k DROP COLUMN IF EXISTS bleu;
 ALTER TABLE modelcomp_50k DROP COLUMN IF EXISTS score_tuned;
 ALTER TABLE modelcomp_50k DROP COLUMN IF EXISTS structured_correctness_tuned;
@@ -356,7 +356,7 @@ ALTER TABLE modelcomp_50k DROP COLUMN IF EXISTS hallucination_tuned;
 ALTER TABLE modelcomp_50k DROP COLUMN IF EXISTS context_grounding_tuned;
 ALTER TABLE modelcomp_50k DROP COLUMN IF EXISTS conciseness_tuned;
 ALTER TABLE modelcomp_50k DROP COLUMN IF EXISTS rouge1_tuned;
-ALTER TABLE modelcomp_50k DROP COLUMN IF EXISTS rougeL_tuned;
+ALTER TABLE modelcomp_50k DROP COLUMN IF EXISTS rougel_tuned;
 ALTER TABLE modelcomp_50k DROP COLUMN IF EXISTS bleu_tuned;
 ALTER TABLE modelcomp_50k DROP COLUMN IF EXISTS improvement;
 ALTER TABLE modelcomp_50k DROP COLUMN IF EXISTS task_label;

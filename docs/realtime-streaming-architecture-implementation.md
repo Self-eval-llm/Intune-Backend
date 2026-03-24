@@ -1,775 +1,312 @@
-# Real-time Streaming Architecture Implementation
+# Real-Time Streaming Architecture Implementation
 
-**Event-Driven Migration: From Polling to Kafka + Spark Pipeline**
+## 0. Scope
+This document provides an implementation-grade architecture for the realtime orchestration stack based on:
+- Supabase Realtime events from `intune_db`
+- Kafka transport and buffering
+- Spark (or standalone processor) trigger generation
+- Trigger consumer stage dispatch
+- Integration with checkpointed incremental learning
 
-## 🎯 Overview
+It is the operational companion to `docs/merged_event_incremental_architecture.md`.
 
-This document outlines the complete migration from polling workers to an event-driven architecture using Supabase Realtime → Kafka → Spark → Trigger Consumer for the `intune_db` real-time workflow.
+---
 
-### **BEFORE (Polling-Based)**
+## 1. System Overview
+### Before
+- Polling loops in workers drove periodic checks.
+- Trigger latency scaled with polling interval.
+- Database load increased due to repetitive count queries.
 
-```
-eval_first.py:    Polls intune_db every 30s for status_eval_first='ready'
-eval_finetune.py: Polls count query every 5 min for >= 2 records with status_eval_first='done'
-                  → Runs finetune → Polls again for post-finetune evaluation
-```
+### After
+- Source mutations are streamed to Kafka immediately.
+- Aggregation/threshold logic emits explicit trigger messages.
+- Consumer executes stage handlers with idempotent dispatch and manual commit semantics.
 
-### **AFTER (Event-Driven)**
-
-```
-Supabase Realtime → Kafka → Spark → Trigger Consumer → eval_finetune.py functions
+```mermaid
+flowchart LR
+    A[(Supabase intune_db)] --> B[event_driven_pipeline/realtime_kafka_bridge.py]
+    B --> C[(Kafka intune.status.events)]
+    C --> D[event_driven_pipeline/spark_pipeline_trigger_job_standalone.py\n or spark_pipeline_trigger_job.py]
+    D --> E[(Kafka pipeline.triggers)]
+    E --> F[event_driven_pipeline/trigger_consumer.py]
+    F --> G[Stage Handler: finetune_and_evaluate or checkpoint_train_eval]
+    G --> H[(modelcomp_50k + reports)]
 ```
 
 ---
 
-## 📋 Implementation Summary
+## 2. Component Contracts
+## 2.1 `realtime_kafka_bridge.py`
+Responsibilities:
+- Subscribe to row-level change events in `intune_db`.
+- Normalize event payload (`record_id`, changed statuses, timestamps).
+- Publish to `intune.status.events`.
+- Route failed deliveries to DLQ topic.
 
-| Phase | Component          | Purpose                        | Status      |
-| ----- | ------------------ | ------------------------------ | ----------- |
-| A     | Schema Extensions  | Add event-driven tables        | ✅ Complete |
-| B     | Realtime Bridge    | Supabase → Kafka               | ✅ Complete |
-| C     | Spark Job          | Kafka → Aggregation + Triggers | ✅ Complete |
-| D     | Trigger Consumer   | Kafka → Stage Execution        | ✅ Complete |
-| E     | Worker Refactoring | Remove polling loops           | ✅ Complete |
-| F     | Validator          | Shadow mode validation         | ✅ Complete |
+Contract:
+- Never block source event ingestion on downstream model operations.
+- Preserve source identifiers for traceability.
 
----
+## 2.2 `spark_pipeline_trigger_job*.py`
+Responsibilities:
+- Consume `intune.status.events`.
+- Maintain rolling state/counts for readiness condition.
+- Emit triggers to `pipeline.triggers` once threshold and policy conditions are satisfied.
+- Upsert current counts to `pipeline_status_counts`.
 
-## 🏗️ Architecture Diagram
+Contract:
+- Trigger emission is deterministic for the configured policy window.
+- Checkpoint state is externally checkpointed by Spark.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     EVENT-DRIVEN INTUNE PIPELINE                        │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  Supabase (intune_db)                                                   │
-│      ↓ status_eval_first/status_eval_final changes                     │
-│      ↓                                                                  │
-│  ┌──────────────────────────────────────┐                              │
-│  │ realtime_kafka_bridge.py              │  (Realtime → Kafka)         │
-│  │ • Listens to intune_db changes        │                             │
-│  │ • Publishes to intune.status.events   │                             │
-│  └──────────────────────────────────────┘                              │
-│      ↓                                                                  │
-│  Kafka Topic: intune.status.events                                      │
-│      ↓                                                                  │
-│  ┌──────────────────────────────────────┐                              │
-│  │ spark_pipeline_trigger_job.py         │  (Kafka → Triggers)         │
-│  │ • Counts status_eval_first='done'     │                             │
-│  │ • Emits trigger when count >= 2       │                             │
-│  │ • Updates pipeline_status_counts       │                             │
-│  └──────────────────────────────────────┘                              │
-│      ↓                                                                  │
-│  Kafka Topic: pipeline.triggers                                         │
-│      ↓                                                                  │
-│  ┌──────────────────────────────────────┐                              │
-│  │ trigger_consumer.py                   │  (Triggers → Execution)     │
-│  │ • Deduplication via trigger log       │                             │
-│  │ • Calls eval_finetune.py functions    │                             │
-│  │ • Manual offset commit                │                             │
-│  └──────────────────────────────────────┘                              │
-│      ↓                                                                  │
-│  app/eval_finetune.py (TRIGGER MODE)                                    │
-│  • prepare_training_data()                                              │
-│  • run_finetune()                                                       │
-│  • evaluate_with_finetuned_model()                                      │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+## 2.3 `trigger_consumer.py`
+Responsibilities:
+- Consume `pipeline.triggers`.
+- Deduplicate via `pipeline_trigger_log`.
+- Dispatch to stage handlers.
+- Commit offsets after durable execution decision.
+
+Contract:
+- Logical duplicate messages must not cause duplicate stage execution.
+- Every trigger results in one of: executed, skipped-duplicate, failed.
+
+## 2.4 Stage Handlers
+Current stage families:
+- `finetune_and_evaluate`
+- `checkpoint_train_eval`
+
+`checkpoint_train_eval` path executes checkpoint-scoped incremental flow:
+1. `11_gen_base_student.py --checkpoint N`
+2. `12_train_incremental.py --checkpoint N --run-all`
 
 ---
 
-## 🔧 Components & How to Run
+## 3. Data Model and Metadata Tables
+Required metadata tables:
+- `pipeline_status_counts`: near-real-time aggregate view.
+- `pipeline_trigger_log`: idempotent trigger execution log.
+- `pipeline_consumed_events`: optional event-level dedupe/audit.
 
-### **Phase A: Database Schema**
-
-**Files Modified:**
-
-- `sql/05_schema_incremental_pipeline.sql`
-
-**What it does:**
-
-- Adds 3 new tables for event-driven architecture:
-  - `pipeline_status_counts` - Live rolling counts from Spark
-  - `pipeline_trigger_log` - Exactly-once trigger execution log
-  - `pipeline_consumed_events` - Kafka event deduplication
-
-**How to deploy:**
-
-```bash
-# Apply schema changes to Supabase
-psql -h <supabase-host> -U postgres -d postgres -f sql/05_schema_incremental_pipeline.sql
-
-# Or via Supabase Dashboard → SQL Editor
-```
-
-**Verification:**
-
-```sql
-SELECT * FROM pipeline_status_counts;
-SELECT * FROM pipeline_trigger_log;
-SELECT * FROM pipeline_consumed_events;
-```
+Recommended key constraints:
+- Unique key on trigger identity (`trigger_id` and/or `dedupe_key`).
+- Indexed lookup on recent trigger time and stage.
 
 ---
 
-### **Phase B: Realtime-to-Kafka Bridge**
+## 4. Trigger Schema
+Recommended payload:
 
-**Files Created:**
-
-- `realtime_kafka_bridge.py`
-
-**What it does:**
-
-- Subscribes to Supabase Realtime on `intune_db` table
-- Tracks both `status_eval_first` and `status_eval_final` columns
-- Publishes normalized events to Kafka topic `intune.status.events`
-- Handles delivery failures with dead-letter queue
-
-**Environment Variables Required:**
-
-```bash
-# .env
-KAFKA_BOOTSTRAP_SERVERS=localhost:9092
-KAFKA_TOPIC_EVENTS=intune.status.events
-KAFKA_TOPIC_DLQ=pipeline.dlq
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_KEY=your-service-role-key
-REALTIME_TABLE=intune_db
-LOG_LEVEL=INFO
+```json
+{
+  "trigger_id": "uuid",
+  "stage": "checkpoint_train_eval",
+  "checkpoint": 2,
+  "source_job": "standalone_processor",
+  "dedupe_key": "ckpt_2_train_eval_20260323_101500",
+  "trace_id": "optional-correlation-id"
+}
 ```
 
-**How to run:**
+Rules:
+- `trigger_id`: unique per emitted trigger event.
+- `dedupe_key`: stable identifier for semantic duplicates.
+- `checkpoint`: required for checkpoint stages.
+- Unknown stages are rejected and logged.
 
-```bash
-# Install dependencies
-pip install confluent-kafka supabase
+---
 
-# Start bridge service
-python realtime_kafka_bridge.py
+## 5. Reliability Semantics
+### Delivery and Processing
+- Kafka provides at-least-once delivery to consumers.
+- Consumer logic enforces exactly-once *effect* via idempotent trigger log insert/check.
+- Manual offset commit occurs after trigger has a durable outcome.
 
-# Monitor Kafka topic (optional)
-kafka-console-consumer --bootstrap-server localhost:9092 --topic intune.status.events --from-beginning
-```
+### Replay Safety
+- Re-reading a trigger message after restart is safe.
+- Duplicate detection produces no-op execution for already handled work.
 
-**Expected Output:**
+### Stage Safety
+- Incremental stage scripts are checkpoint-scoped.
+- Status progression in `modelcomp_50k` supports partial resume and retry.
 
-```
-2024-03-18 10:15:23,456 - __main__ - INFO - Bridge started. Listening on Supabase Realtime.
-2024-03-18 10:15:45,123 - __main__ - INFO - Published event: record_id=123 status_eval_first=done, status_eval_final=None
+---
+
+## 6. Sequence: Realtime to Checkpoint Completion
+```mermaid
+sequenceDiagram
+    participant DB as intune_db
+    participant RB as realtime_kafka_bridge
+    participant KE as kafka:intune.status.events
+    participant SP as spark/standalone trigger job
+    participant KT as kafka:pipeline.triggers
+    participant TC as trigger_consumer
+    participant LOG as pipeline_trigger_log
+    participant ST as stage handlers
+
+    DB->>RB: Row status update
+    RB->>KE: Publish normalized event
+    SP->>KE: Consume event
+    SP->>SP: Update counts + threshold check
+    SP->>KT: Emit trigger
+    TC->>KT: Consume trigger
+    TC->>LOG: Insert/check dedupe key
+    alt New trigger
+        TC->>ST: Dispatch stage
+        ST-->>TC: Success/Failure
+    else Duplicate trigger
+        TC-->>TC: Skip execution
+    end
+    TC->>TC: Commit offset
 ```
 
 ---
 
-### **Phase C: Spark Structured Streaming Job**
-
-**Files Created:**
-
-- `spark_pipeline_trigger_job.py`
-
-**What it does:**
-
-- Reads events from Kafka topic `intune.status.events`
-- Counts records with `status_eval_first='done'`
-- Emits trigger to `pipeline.triggers` when count >= 2 (demo threshold)
-- Upserts live counts to `pipeline_status_counts` table
-
-**Environment Variables Required:**
+## 7. Runtime Configuration
+Core environment variables:
 
 ```bash
-# Additional to Phase B
-KAFKA_TOPIC_TRIGGERS=pipeline.triggers
-SPARK_CHECKPOINT_DIR=/tmp/spark-checkpoints/pipeline
-TRIGGER_THRESHOLD=2
-```
-
-**How to run:**
-
-```bash
-# Install Spark
-pip install pyspark
-
-# Start Spark job
-spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.0 spark_pipeline_trigger_job.py
-
-# Or with python (if Spark is configured)
-python spark_pipeline_trigger_job.py
-```
-
-**Expected Output:**
-
-```
-2024-03-18 10:20:15,789 - __main__ - INFO - Spark streaming job started
-2024-03-18 10:20:30,456 - __main__ - INFO - Count upsert stream started
-2024-03-18 10:20:31,123 - __main__ - INFO - Trigger emission stream started
-2024-03-18 10:21:00,789 - __main__ - INFO - 🔥 TRIGGER EMITTED: finetune_2 (count=2)
-```
-
-**Monitor Kafka Triggers:**
-
-```bash
-kafka-console-consumer --bootstrap-server localhost:9092 --topic pipeline.triggers --from-beginning
-```
-
----
-
-### **Phase D: Trigger Consumer**
-
-**Files Created:**
-
-- `trigger_consumer.py`
-
-**What it does:**
-
-- Consumes trigger events from Kafka topic `pipeline.triggers`
-- Implements deduplication via `pipeline_trigger_log` table
-- Calls `app/eval_finetune.py` functions in sequence:
-  1. `prepare_training_data()`
-  2. `run_finetune()`
-  3. `evaluate_with_finetuned_model()`
-
-**Environment Variables Required:**
-
-```bash
-# Additional to previous phases
-KAFKA_GROUP_ID=pipeline-trigger-consumer
-```
-
-**How to run:**
-
-**Event-driven mode (normal operation):**
-
-```bash
-python trigger_consumer.py
-```
-
-**Manual fallback mode (testing/emergency):**
-
-```bash
-python trigger_consumer.py --manual --stage finetune_and_evaluate
-```
-
-**Expected Output:**
-
-```
-2024-03-18 10:25:00,123 - __main__ - INFO - Processing trigger: finetune_2
-2024-03-18 10:25:00,456 - __main__ - INFO - 🚀 Dispatching to handler: finetune_and_evaluate
-2024-03-18 10:25:01,789 - __main__ - INFO - Step 1/3: Preparing training data...
-2024-03-18 10:25:30,456 - __main__ - INFO - Step 2/3: Running finetune...
-2024-03-18 10:30:15,123 - __main__ - INFO - Step 3/3: Evaluating with finetuned model...
-2024-03-18 10:35:45,789 - __main__ - INFO - ✅ Complete finetune workflow finished successfully
-2024-03-18 10:35:45,890 - __main__ - INFO - ✅ Trigger processed successfully: finetune_2
-```
-
----
-
-### **Phase E: Worker Refactoring**
-
-**Files Modified:**
-
-- `app/eval_finetune.py`
-
-**What changed:**
-
-- Added TRIGGER MODE documentation
-- Modified `evaluate_with_finetuned_model()` to process ALL pending records in one pass (no polling)
-- Preserved MANUAL MODE for backward compatibility
-
-**Functions available for trigger_consumer.py:**
-
-- ✅ `prepare_training_data()` - Fetch records with `status_eval_first='done'`
-- ✅ `run_finetune()` - Execute finetune.py script
-- ✅ `evaluate_with_finetuned_model()` - Process all pending records
-
-**How to test manually:**
-
-```bash
-# Legacy polling mode (for testing)
-python app/eval_finetune.py
-
-# Or test individual functions in Python
-python -c "
-from app.eval_finetune import prepare_training_data, run_finetune, evaluate_with_finetuned_model
-print('Testing prepare_training_data():', prepare_training_data())
-print('Testing run_finetune():', run_finetune())
-print('Testing evaluate_with_finetuned_model():', evaluate_with_finetuned_model())
-"
-```
-
----
-
-### **Phase F: Shadow Mode Validator**
-
-**Files Created:**
-
-- `pipeline_validator.py`
-
-**What it does:**
-
-- Compares stream counts (from Spark) vs direct database counts
-- Validates the event-driven system against source of truth
-- Exit code 0 = success, 1 = mismatch (for alerting)
-
-**How to run:**
-
-**Manual validation:**
-
-```bash
-# Validate all statuses
-python pipeline_validator.py
-
-# Validate specific status
-python pipeline_validator.py --status done
-```
-
-**Scheduled validation (recommended for shadow mode):**
-
-```bash
-# Add to crontab - check every 5 minutes
-*/5 * * * * cd /path/to/project && \
-            source venv/bin/activate && \
-            python pipeline_validator.py || \
-            curl -X POST https://hooks.slack.com/your-webhook \
-                 -d '{"text":"❌ intune_db count mismatch detected!"}'
-```
-
-**Expected Output:**
-
-```
-======================================================================
-COMPARISON RESULTS
-======================================================================
-✅ OK: status=ready         count=45
-✅ OK: status=done          count=2
-✅ OK: status=pending       count=1853
-======================================================================
-SUMMARY
-======================================================================
-Total checks:    3
-OK:              3
-Mismatches:      0
-Missing:         0
-======================================================================
-✅ VALIDATION PASSED: All counts match!
-```
-
----
-
-## 🚀 Deployment Sequence
-
-### **Step 1: Prerequisites**
-
-```bash
-# 1. Install dependencies
-pip install confluent-kafka pyspark supabase
-
-# 2. Set up environment variables
-cp .env.example .env
-# Edit .env with your Kafka, Supabase credentials
-
-# 3. Deploy schema changes
-psql -h <supabase-host> -U postgres -f sql/05_schema_incremental_pipeline.sql
-```
-
-### **Step 2: Start Services (Shadow Mode)**
-
-**Terminal 1: Realtime Bridge**
-
-```bash
-python realtime_kafka_bridge.py
-```
-
-**Terminal 2: Spark Job**
-
-```bash
-spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.0 spark_pipeline_trigger_job.py
-```
-
-**Terminal 3: Validation (every 5 min)**
-
-```bash
-watch -n 300 python pipeline_validator.py
-```
-
-### **Step 3: Test Event Flow**
-
-```bash
-# 1. Insert test record into intune_db
-# 2. Update status_eval_first from 'ready' to 'done'
-# 3. Repeat until count >= 2
-# 4. Monitor logs - should see trigger emitted and processed
-
-# Check Kafka topics
-kafka-topics --list --bootstrap-server localhost:9092
-kafka-console-consumer --bootstrap-server localhost:9092 --topic intune.status.events --from-beginning
-kafka-console-consumer --bootstrap-server localhost:9092 --topic pipeline.triggers --from-beginning
-```
-
-### **Step 4: Start Trigger Consumer**
-
-**After shadow mode validation passes:**
-
-```bash
-python trigger_consumer.py
-```
-
-### **Step 5: Monitoring**
-
-```bash
-# Check pipeline_status_counts for live counts
-echo "SELECT * FROM pipeline_status_counts WHERE checkpoint = -1;" | psql -h <supabase-host> -U postgres
-
-# Check trigger execution log
-echo "SELECT * FROM pipeline_trigger_log ORDER BY fired_at DESC LIMIT 5;" | psql -h <supabase-host> -U postgres
-
-# Check consumed events
-echo "SELECT * FROM pipeline_consumed_events ORDER BY consumed_at DESC LIMIT 5;" | psql -h <supabase-host> -U postgres
-```
-
----
-
-## 🔍 Key Configuration
-
-### **Environment Variables**
-
-```bash
-# Kafka Configuration
+# Kafka
 KAFKA_BOOTSTRAP_SERVERS=localhost:9092
 KAFKA_TOPIC_EVENTS=intune.status.events
 KAFKA_TOPIC_TRIGGERS=pipeline.triggers
 KAFKA_TOPIC_DLQ=pipeline.dlq
 KAFKA_GROUP_ID=pipeline-trigger-consumer
 
-# Supabase Configuration
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_KEY=your-service-role-key
-REALTIME_TABLE=intune_db
+# Supabase
+SUPABASE_URL=https://<project>.supabase.co
+SUPABASE_KEY=<service-role-key>
 REALTIME_SCHEMA=public
+REALTIME_TABLE=intune_db
 
-# Pipeline Configuration
-TRIGGER_THRESHOLD=2                    # Demo: 2, Production: 5000
+# Trigger Policy
+TRIGGER_THRESHOLD=2
+
+# Spark
 SPARK_CHECKPOINT_DIR=/tmp/spark-checkpoints/pipeline
+
+# Logging
 LOG_LEVEL=INFO
-
-# Validator Configuration
-SOURCE_TABLE=intune_db
-STATUS_COLUMN=status_eval_first
-```
-
-### **Kafka Topics Required**
-
-```bash
-# Create topics (if using local Kafka)
-kafka-topics --create --topic intune.status.events --bootstrap-server localhost:9092 --partitions 3 --replication-factor 1
-kafka-topics --create --topic pipeline.triggers --bootstrap-server localhost:9092 --partitions 1 --replication-factor 1
-kafka-topics --create --topic pipeline.dlq --bootstrap-server localhost:9092 --partitions 1 --replication-factor 1
 ```
 
 ---
 
-## 🧪 Testing & Validation
-
-### **Unit Tests**
-
+## 8. Runbook
+### 8.1 Prerequisites
 ```bash
-# Test individual components
-python -c "
-import os
-os.environ['SUPABASE_URL'] = 'your-url'
-os.environ['SUPABASE_KEY'] = 'your-key'
-
-from src.database.supabase_client import upsert_pipeline_count, insert_trigger_log_if_new, mark_event_consumed
-
-# Test helper functions
-print('Testing upsert_pipeline_count...')
-upsert_pipeline_count(-1, 'done', 2)
-
-print('Testing insert_trigger_log_if_new...')
-result = insert_trigger_log_if_new('test-trigger-123', -1, 'finetune_and_evaluate')
-print(f'New trigger logged: {result}')
-
-print('Testing mark_event_consumed...')
-mark_event_consumed('test-event-456', 'trigger_consumer')
-print('Event marked as consumed')
-"
+pip install confluent-kafka pyspark supabase
+psql -h <host> -U postgres -d postgres -f sql/05_schema_incremental_pipeline.sql
 ```
 
-### **Integration Tests**
-
+### 8.2 Start Services
+Terminal 1:
 ```bash
-# 1. Start all services
-# 2. Insert test data into intune_db
-# 3. Update status_eval_first='ready' → 'done' for 2 records
-# 4. Verify trigger fires and workflow completes
-# 5. Check all audit tables have entries
-
-# Test trigger consumer manually
-python trigger_consumer.py --manual --stage finetune_and_evaluate
+python event_driven_pipeline/realtime_kafka_bridge.py
 ```
 
-### **Load Testing**
-
+Terminal 2:
 ```bash
-# Simulate high-volume status updates
-python -c "
-import time
-from src.database.supabase_client import get_supabase_client
+python event_driven_pipeline/spark_pipeline_trigger_job_standalone.py
+```
 
-supabase = get_supabase_client()
+(Or Spark variant)
+```bash
+spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.0 event_driven_pipeline/spark_pipeline_trigger_job.py
+```
 
-# Create and update many records rapidly
-for i in range(100):
-    # Insert record with status_eval_first='ready'
-    supabase.table('intune_db').insert({
-        'input': f'Test input {i}',
-        'expected_output': f'Expected {i}',
-        'status_eval_first': 'ready'
-    }).execute()
+Terminal 3:
+```bash
+python event_driven_pipeline/trigger_consumer.py
+```
 
-    # Update to 'done'
-    time.sleep(0.1)  # Small delay
-
-print('Load test complete - monitor Kafka and Spark for performance')
-"
+### 8.3 Manual Fallback
+```bash
+python event_driven_pipeline/trigger_consumer.py --manual --stage finetune_and_evaluate
 ```
 
 ---
 
-## 🚨 Debugging & Troubleshooting
+## 9. Observability and SLOs
+### Core Metrics
+- Event ingest rate and bridge publish success.
+- Event-to-trigger latency (p50, p95, p99).
+- Trigger execution latency by stage.
+- Consumer lag (`intune.status.events`, `pipeline.triggers`).
+- Duplicate trigger skip rate.
+- Checkpoint completion success ratio.
 
-### **Common Issues**
-
-**1. Realtime Bridge not receiving events:**
-
-```bash
-# Check Supabase Realtime is enabled
-# Verify table has Row Level Security policies
-# Check network connectivity to Supabase
-
-# Test Realtime manually
-python -c "
-from supabase import create_client
-client = create_client('your-url', 'your-key')
-channel = client.channel('test-channel')
-channel.on_postgres_changes(
-    event='*', schema='public', table='intune_db',
-    callback=lambda x: print(f'Event: {x}')
-).subscribe()
-print('Listening for changes...')
-import time; time.sleep(60)
-"
-```
-
-**2. Spark job not starting:**
-
-```bash
-# Check Spark installation
-spark-submit --version
-
-# Check Kafka connectivity
-kafka-console-consumer --bootstrap-server localhost:9092 --topic intune.status.events --timeout-ms 5000
-
-# Check Spark logs
-ls /tmp/spark-checkpoints/pipeline/
-tail -f /tmp/spark-*.log
-```
-
-**3. Trigger consumer not processing:**
-
-```bash
-# Check Kafka consumer group status
-kafka-consumer-groups --bootstrap-server localhost:9092 --describe --group pipeline-trigger-consumer
-
-# Check trigger log table
-echo "SELECT * FROM pipeline_trigger_log ORDER BY fired_at DESC LIMIT 5;" | psql -h <supabase-host> -U postgres
-
-# Manual trigger test
-python trigger_consumer.py --manual --stage finetune_and_evaluate
-```
-
-**4. Count mismatches in validator:**
-
-```bash
-# Check pipeline_status_counts table
-echo "SELECT * FROM pipeline_status_counts WHERE checkpoint = -1;" | psql -h <supabase-host> -U postgres
-
-# Check direct counts
-echo "SELECT status_eval_first, COUNT(*) FROM intune_db GROUP BY status_eval_first;" | psql -h <supabase-host> -U postgres
-
-# Check for Spark processing lag
-# Look at Spark UI: http://localhost:4040
-```
-
-### **Log Locations**
-
-```bash
-# Service logs (adjust paths as needed)
-tail -f realtime_kafka_bridge.log
-tail -f spark_pipeline_trigger_job.log
-tail -f trigger_consumer.log
-
-# Kafka logs
-tail -f /opt/kafka/logs/server.log
-
-# Spark logs
-tail -f /tmp/spark-*.log
-```
+### Suggested SLO Targets
+- Trigger emission latency p95 < 30s.
+- Trigger dispatch latency p95 < 10s.
+- Duplicate execution count = 0.
+- Weekly stage success > 99%.
 
 ---
 
-## 📈 Performance & Monitoring
-
-### **Key Metrics to Monitor**
-
-1. **Realtime Bridge:**
-   - Events published per second
-   - Kafka delivery success rate
-   - Dead-letter queue size
-
-2. **Spark Job:**
-   - Processing latency (event time to trigger emission)
-   - Throughput (events/second)
-   - Memory usage
-
-3. **Trigger Consumer:**
-   - Kafka consumer lag
-   - Trigger execution time
-   - Success/failure rate
-
-4. **Database:**
-   - `pipeline_status_counts` freshness
-   - `pipeline_trigger_log` growth rate
-   - Query performance on `intune_db`
-
-### **Scaling Considerations**
-
-**Horizontal Scaling:**
-
-```bash
-# Multiple bridge instances (different partitions)
-KAFKA_PARTITION_ID=0 python realtime_kafka_bridge.py
-KAFKA_PARTITION_ID=1 python realtime_kafka_bridge.py
-
-# Multiple trigger consumers (same group)
-python trigger_consumer.py  # Instance 1
-python trigger_consumer.py  # Instance 2
-
-# Spark cluster mode
-spark-submit --master spark://cluster:7077 spark_pipeline_trigger_job.py
-```
-
-**Performance Tuning:**
-
-```bash
-# Kafka producer configs
-KAFKA_BATCH_SIZE=16384
-KAFKA_LINGER_MS=5
-KAFKA_COMPRESSION_TYPE=snappy
-
-# Spark configs
-SPARK_SQL_SHUFFLE_PARTITIONS=200
-SPARK_STREAMING_BATCH_INTERVAL=2s
-SPARK_MEMORY_FRACTION=0.8
-```
+## 10. Failure Modes and Triage
+| Symptom | Likely Domain | First Check | Primary Recovery |
+| --- | --- | --- | --- |
+| No events in Kafka | Bridge | bridge logs + Supabase connectivity | restart bridge, verify credentials |
+| Events but no triggers | Spark/processor | threshold config + stream health | restart job from checkpoint |
+| Triggers not executed | Consumer | group lag + trigger logs | restart consumer, inspect dedupe conflicts |
+| Duplicate executions | Idempotency | unique constraints/log path | enforce trigger uniqueness + skip logic |
+| Frequent DB timeout errors | Stage scripts | query patterns / batch sizing | keyset scan + retry/backoff tuning |
 
 ---
 
-## 🔒 Security & Production Considerations
+## 11. Scaling Model
+### Horizontal Strategies
+- Scale bridge instances by topic partitions.
+- Scale consumers in same group for trigger throughput.
+- Isolate stage execution workers from consumer process where GPU contention exists.
 
-### **Security Checklist**
-
-- [ ] Supabase Row Level Security (RLS) policies enabled
-- [ ] Kafka SASL/SSL authentication configured
-- [ ] Environment variables in secure storage (not .env files)
-- [ ] Network security groups restrict access
-- [ ] Monitoring and alerting configured
-- [ ] Backup procedures for pipeline\_\* tables
-
-### **Production Deployment**
-
-```bash
-# Use container orchestration (Kubernetes/Docker Swarm)
-# Example Docker Compose stack:
-
-version: '3.8'
-services:
-  realtime-bridge:
-    build: .
-    command: python realtime_kafka_bridge.py
-    environment:
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - SUPABASE_URL=${SUPABASE_URL}
-      - SUPABASE_KEY=${SUPABASE_KEY}
-    depends_on:
-      - kafka
-
-  spark-job:
-    build: .
-    command: spark-submit spark_pipeline_trigger_job.py
-    environment:
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - SPARK_CHECKPOINT_DIR=/opt/spark/checkpoints
-    volumes:
-      - spark-checkpoints:/opt/spark/checkpoints
-
-  trigger-consumer:
-    build: .
-    command: python trigger_consumer.py
-    environment:
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - KAFKA_GROUP_ID=pipeline-trigger-consumer
-    depends_on:
-      - kafka
-```
+### Performance Tuning
+- Kafka producer batching/compression.
+- Spark micro-batch interval tuning.
+- Controlled checkpoint batch sizes in stage scripts.
 
 ---
 
-## ✅ Success Criteria
-
-**Migration is successful when:**
-
-1. ✅ **Zero Polling**: No `time.sleep()` calls in production workers
-2. ✅ **Real-time Processing**: Status changes trigger execution within seconds
-3. ✅ **Exactly-Once Semantics**: No duplicate finetune executions
-4. ✅ **Fault Tolerance**: System recovers from failures without data loss
-5. ✅ **Monitoring**: All components have health checks and metrics
-6. ✅ **Validation**: Shadow mode shows 100% count accuracy for 24+ hours
-
-**Performance Improvements:**
-
-- **Latency**: Status change → Finetune start: `~5 minutes` → `~10 seconds`
-- **Resource Usage**: `~30% reduction` in database load (no constant polling)
-- **Scalability**: Can handle `10x more concurrent evaluations`
+## 12. Security and Operations
+Checklist:
+- RLS and service-role handling policy validated.
+- Kafka auth/TLS enabled in production.
+- Secrets loaded from managed secret store.
+- DLQ and alert rules configured.
+- Audit retention policy for pipeline metadata tables.
 
 ---
 
-## 📞 Support & Maintenance
+## 13. Rollback Strategy
+If event-driven path must be paused:
+1. Stop bridge, processor, consumer.
+2. Resume manual worker execution (`app/eval_finetune.py`) as interim mode.
+3. Preserve Kafka offsets and trigger logs for controlled re-entry.
 
-**Emergency Rollback:**
-
-```bash
-# Stop event-driven services
-pkill -f realtime_kafka_bridge.py
-pkill -f spark_pipeline_trigger_job.py
-pkill -f trigger_consumer.py
-
-# Resume manual polling
-python app/eval_finetune.py
-```
-
-**Health Checks:**
-
-```bash
-# Check all services are running
-ps aux | grep -E "(realtime_kafka_bridge|spark_pipeline_trigger_job|trigger_consumer)"
-
-# Check recent activity
-python pipeline_validator.py --status done
-echo "SELECT COUNT(*) FROM pipeline_trigger_log WHERE fired_at > NOW() - INTERVAL '1 hour';" | psql -h <supabase-host> -U postgres
-```
+This rollback is operational, not destructive; metadata remains available for replay analysis.
 
 ---
 
-**🎉 Event-Driven Architecture Migration Complete!**
+## 14. Validation Plan
+### Shadow Validation
+- Run validator periodically:
 
-The system now operates with **sub-second triggering** instead of **5-minute polling loops**, providing real-time responsiveness while maintaining exactly-once execution guarantees.
+```bash
+python event_driven_pipeline/pipeline_validator.py
+python event_driven_pipeline/pipeline_validator.py --status done
+```
+
+- Compare stream counts and source counts for 24h before tightening thresholds.
+
+### Functional Validation
+- Inject controlled status transitions.
+- Verify trigger emission and exactly-once execution path.
+- Verify checkpoint progression in `modelcomp_50k` and output artifact generation.
+
+---
+
+## 15. Expected Outcome
+With the above implementation:
+- Polling windows are removed from the critical trigger path.
+- Triggering becomes near-real-time.
+- Incremental training remains checkpoint-governed and auditable.
+- Reliability improves via replay-safe, idempotent consumer design.

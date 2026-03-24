@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import argparse
+from postgrest.exceptions import APIError
 
 # Disable torch dynamo/compile completely to avoid Triton issues
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
@@ -30,8 +31,32 @@ load_dotenv()
 # Config - use 4bit for speed
 MODEL_NAME = "unsloth/gemma-3-1b-it-bnb-4bit"
 BATCH_SIZE = 50  # Records per Supabase fetch
+SCAN_PAGE_SIZE = 250  # Checkpoint-scoped keyset page size
 MAX_NEW_TOKENS = 256  # Shorter outputs for speed
 RECORDS_PER_CHECKPOINT = 5000
+
+
+def is_statement_timeout_error(exc):
+    """Return True for Postgres statement timeout surfaced via PostgREST."""
+    message = str(exc).lower()
+    return (
+        "statement timeout" in message
+        or "canceling statement due to statement timeout" in message
+        or "'code': '57014'" in message
+    )
+
+
+def execute_with_retry(query_builder, op_name, max_retries=4, base_delay=1.5):
+    """Execute a Supabase query with retry on statement timeout."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            return query_builder().execute()
+        except APIError as e:
+            if not is_statement_timeout_error(e) or attempt == max_retries:
+                raise
+            sleep_s = base_delay * attempt
+            print(f"⚠️  {op_name} timed out (attempt {attempt}/{max_retries}), retrying in {sleep_s:.1f}s...")
+            time.sleep(sleep_s)
 
 def load_model():
     """Load base Gemma model with 4-bit quantization using Unsloth"""
@@ -100,11 +125,13 @@ def main():
         # Auto-detect: find lowest checkpoint with missing student_output
         print("Auto-detecting checkpoint...")
         for ckpt in range(1, 11):
-            result = supabase.table('modelcomp_50k')\
-                .select('id', count='exact')\
-                .eq('checkpoint', ckpt)\
-                .is_('student_output', 'null')\
-                .execute()
+            result = execute_with_retry(
+                lambda: supabase.table('modelcomp_50k')
+                    .select('id', count='exact')
+                    .eq('checkpoint', ckpt)
+                    .is_('student_output', 'null'),
+                f"count pending checkpoint {ckpt}",
+            )
             if result.count > 0:
                 target_ckpt = ckpt
                 print(f"  Checkpoint {ckpt}: {result.count} records pending")
@@ -114,19 +141,23 @@ def main():
             return
     
     # Check pending for this checkpoint
-    result = supabase.table('modelcomp_50k')\
-        .select('id', count='exact')\
-        .eq('checkpoint', target_ckpt)\
-        .is_('student_output', 'null')\
-        .execute()
+    result = execute_with_retry(
+        lambda: supabase.table('modelcomp_50k')
+            .select('id', count='exact')
+            .eq('checkpoint', target_ckpt)
+            .is_('student_output', 'null'),
+        f"count pending checkpoint {target_ckpt}",
+    )
     pending_count = result.count
     
     # Check already done
-    done_result = supabase.table('modelcomp_50k')\
-        .select('id', count='exact')\
-        .eq('checkpoint', target_ckpt)\
-        .not_.is_('student_output', 'null')\
-        .execute()
+    done_result = execute_with_retry(
+        lambda: supabase.table('modelcomp_50k')
+            .select('id', count='exact')
+            .eq('checkpoint', target_ckpt)
+            .not_.is_('student_output', 'null'),
+        f"count done checkpoint {target_ckpt}",
+    )
     done_count = done_result.count
     
     print(f"\n{'='*60}")
@@ -148,22 +179,45 @@ def main():
     # Process in batches (only for this checkpoint)
     total_processed = 0
     
+    last_seen_id = 0
+    pending_buffer = []
+
     while True:
-        # Fetch batch without student_output FOR THIS CHECKPOINT
-        batch = supabase.table('modelcomp_50k')\
-            .select('id, input, context')\
-            .eq('checkpoint', target_ckpt)\
-            .is_('student_output', 'null')\
-            .order('id')\
-            .limit(BATCH_SIZE)\
-            .execute()
-        
-        if not batch.data:
+        while len(pending_buffer) < BATCH_SIZE:
+            page = execute_with_retry(
+                lambda: supabase.table('modelcomp_50k')
+                    .select('id, input, context, student_output')
+                    .eq('checkpoint', target_ckpt)
+                    .gt('id', last_seen_id)
+                    .order('id')
+                    .limit(SCAN_PAGE_SIZE),
+                f"fetch checkpoint {target_ckpt} page after id {last_seen_id}",
+            )
+
+            if not page.data:
+                break
+
+            last_seen_id = page.data[-1]['id']
+            for row in page.data:
+                if row.get('student_output') in (None, ''):
+                    pending_buffer.append({
+                        'id': row['id'],
+                        'input': row['input'],
+                        'context': row.get('context', ''),
+                    })
+
+            if len(page.data) < SCAN_PAGE_SIZE:
+                break
+
+        if not pending_buffer:
             break
-        
-        print(f"\nProcessing batch of {len(batch.data)} records (Checkpoint {target_ckpt})...")
-        
-        for record in tqdm(batch.data, desc=f"Ckpt {target_ckpt}"):
+
+        current_batch = pending_buffer[:BATCH_SIZE]
+        pending_buffer = pending_buffer[BATCH_SIZE:]
+
+        print(f"\nProcessing batch of {len(current_batch)} records (Checkpoint {target_ckpt})...")
+
+        for record in tqdm(current_batch, desc=f"Ckpt {target_ckpt}"):
             try:
                 output, latency = generate_output(
                     model, tokenizer,
@@ -172,10 +226,13 @@ def main():
                 )
                 
                 # Update Supabase immediately after each record
-                supabase.table('modelcomp_50k').update({
-                    'student_output': output[:5000],
-                    'generation_latency': round(latency, 3)
-                }).eq('id', record['id']).execute()
+                execute_with_retry(
+                    lambda: supabase.table('modelcomp_50k').update({
+                        'student_output': output[:5000],
+                        'generation_latency': round(latency, 3)
+                    }).eq('id', record['id']),
+                    f"update record {record['id']}",
+                )
                 
                 total_processed += 1
                 
