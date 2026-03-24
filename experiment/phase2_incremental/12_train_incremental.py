@@ -162,7 +162,7 @@ LORA_ALPHA = 16
 LORA_DROPOUT = 0
 
 STATUS_FLOW = ['score', 'finetune', 'output_tuned', 'score_tuned', 'completed']
-MIN_RECORDS_PER_CHECKPOINT = 4500
+MIN_RECORDS_PER_CHECKPOINT = 0
 
 # How many rows to UPDATE per Supabase client session.
 # Each batch opens ONE fresh HTTP/2 connection and executes rows sequentially
