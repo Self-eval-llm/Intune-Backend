@@ -250,6 +250,8 @@ class RealtimeKafkaBridge:
             for attempt in range(MAX_RETRY_ATTEMPTS):
                 if self.producer.publish_event(event):
                     success = True
+                    import time
+                    print(f"\n[METRIC 1] DB WRITE DETECTED at: {time.time()}") # ADD THIS
                     status_msg = f"status_eval_first={event['status_eval_first']}, status_eval_final={event['status_eval_final']}"
                     logger.info(f"Published event: record_id={event['record_id']} {status_msg}")
                     break

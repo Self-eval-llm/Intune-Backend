@@ -160,6 +160,8 @@ class TriggerConsumer:
                 return False
 
             logger.info(f"Processing trigger: {dedupe_key}")
+            import time
+            print(f"\n[METRIC 2] TRIGGER RECEIVED at: {time.time()}") # ADD THIS
 
             # Custom deduplication using the trigger's dedupe_key
             try:

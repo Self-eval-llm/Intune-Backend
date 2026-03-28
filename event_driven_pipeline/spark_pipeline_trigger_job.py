@@ -35,7 +35,7 @@ from pyspark.sql.functions import (
 from pyspark.sql.types import (
     StructType, StructField, StringType, IntegerType, TimestampType
 )
-from pyspark.sql.streaming import GroupState, GroupStateTimeout
+from pyspark.sql.streaming.state import GroupState, GroupStateTimeout
 
 # Load environment variables
 load_dotenv()
@@ -99,9 +99,8 @@ event_schema = StructType([
 # ============================================================================
 
 # Trigger when status_eval_first changes to 'done'
-TARGET_STATUS = "done"
-TRIGGER_STAGE = "finetune_and_evaluate"
-
+TARGET_STATUS = "score"
+TRIGGER_STAGE = "finetune"
 
 # ============================================================================
 # SUPABASE COUNT WRITE
@@ -162,6 +161,7 @@ def main():
         .appName("INTUNEPipelineTrigger") \
         .config("spark.sql.shuffle.partitions", "4") \
         .config("spark.streaming.stopGracefullyOnShutdown", "true") \
+        .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0") \
         .getOrCreate()
 
     spark.sparkContext.setLogLevel("WARN")
@@ -180,6 +180,9 @@ def main():
     events_df = kafka_df.select(
         from_json(col("value").cast("string"), event_schema).alias("data")
     ).select("data.*")
+
+    # Convert string timestamp to actual Spark TimestampType
+    events_df = events_df.withColumn("event_ts", col("event_ts").cast("timestamp"))
 
     # Add watermark for late data (5-minute tolerance)
     events_df = events_df.withWatermark("event_ts", "5 minutes")

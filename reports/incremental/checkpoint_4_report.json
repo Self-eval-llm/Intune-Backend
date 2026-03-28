@@ -1,0 +1,11 @@
+{
+  "checkpoint": 4,
+  "timestamp": "2026-03-27T11:22:49.504124",
+  "records": 4969,
+  "score_before": 0.4222,
+  "score_after": 0.4232,
+  "improvement": 0.0009,
+  "improvement_pct": 0.22,
+  "improved_pct": 45.4,
+  "regressed_pct": 52.3
+}
