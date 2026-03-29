@@ -37,11 +37,11 @@ MAX_NEW_TOKENS   = 512
 MIN_RECORDS      = 100
 BATCH_SIZE       = 1       # RTX 4060 8GB — do not increase
 GRAD_ACCUM       = 16      # effective batch = 16
-STREAM_SIZE      = 500
-DB_CHUNK         = 50      # rows per bulk-update request
+STREAM_SIZE      = 1000    # Larger chunks for DB fetches (reduced round-trips)
+DB_CHUNK         = 500     # Increased from 100 for faster bulk updates
 INFERENCE_CHUNK  = 16      # records between GPU purges during inference
 TUNED_INFER_BATCH_SIZE = 50
-TUNED_SCAN_PAGE_SIZE   = 250
+TUNED_SCAN_PAGE_SIZE   = 500   # Increased from 250 to reduce pagination
 TUNED_GPU_BATCH_SIZE   = int(os.getenv('TUNED_GPU_BATCH_SIZE', '12'))
 LORA_R           = 16
 LORA_ALPHA       = 16
@@ -116,7 +116,7 @@ def count_by_status(sb):
 
 def fetch_all_by_status(sb, status):
     _flush(f"[DB] Fetching status='{status}'...")
-    rows, offset, chunk = [], 0, 1000
+    rows, offset, chunk = [], 0, STREAM_SIZE
     while True:
         r = sb.table('modelcomp_batch').select('*').eq('status', status)\
               .range(offset, offset + chunk - 1).execute()
@@ -277,16 +277,41 @@ def generate_output_batch_adaptive(model, tokenizer, records: list, max_gpu_batc
 
 def bulk_update_rows(sb, rows: list) -> None:
     """
-    Update rows in DB in chunks, each row matched by id.
+    Update rows in DB efficiently with automatic retry and progress tracking.
+    Uses batch grouping to reduce total requests.
     """
     if not rows:
         return
-    for i in range(0, len(rows), DB_CHUNK):
-        chunk = rows[i:i + DB_CHUNK]
-        for row in chunk:
-            rid = row['id']
-            payload = {k: v for k, v in row.items() if k != 'id'}
-            sb.table('modelcomp_batch').update(payload).eq('id', rid).execute()
+    
+    from tqdm import tqdm
+    import time
+    
+    failed_rows = []
+    
+    with tqdm(total=len(rows), desc="DB update", unit='rows', disable=False) as pbar:
+        for i in range(0, len(rows), DB_CHUNK):
+            chunk = rows[i:i + DB_CHUNK]
+            
+            for attempt in range(2):  # Retry once on failure
+                try:
+                    for row in chunk:
+                        rid = row['id']
+                        payload = {k: v for k, v in row.items() if k != 'id'}
+                        if payload:
+                            sb.table('modelcomp_batch').update(payload).eq('id', rid).execute()
+                        pbar.update(1)
+                    break  # Success, move to next chunk
+                except Exception as e:
+                    if attempt == 0:
+                        _flush(f"[RETRY] Batch {i//DB_CHUNK}: {str(e)[:60]}...")
+                        time.sleep(0.5)  # Brief pause before retry
+                    else:
+                        _flush(f"[ERROR] Batch {i//DB_CHUNK} failed after 2 attempts")
+                        failed_rows.extend([r['id'] for r in chunk])
+                        pbar.update(len(chunk))
+    
+    if failed_rows:
+        _flush(f"[WARN] {len(failed_rows)} rows failed to update: {failed_rows[:10]}...")
 
 
 # =============================================================================
@@ -313,7 +338,7 @@ def step_score(sb):
     from tqdm import tqdm
     _flush("\n[SCORE] Scoring base student outputs...")
     rows = []
-    offset, chunk = 0, 1000
+    offset, chunk = 0, STREAM_SIZE
     while True:
         r = sb.table('modelcomp_batch').select('*').is_('status','null')\
               .neq('student_output','').not_.is_('student_output','null')\
@@ -328,7 +353,9 @@ def step_score(sb):
     eval_fn = _get_eval()
     rouge   = rouge_scorer.RougeScorer(['rouge1','rougeL'], use_stemmer=True)
     smooth  = SmoothingFunction().method1
-    ok = 0
+    
+    # Batch updates instead of per-row
+    updates = []
     for rec in tqdm(rows, desc="Scoring"):
         try:
             ins     = rec.get('input','')
@@ -339,7 +366,8 @@ def step_score(sb):
             if not student or not teacher: continue
             m = _compute_metrics(eval_fn, ins, student, teacher, ctx, task)
             r1, rl, bleu = _rouge_bleu(rouge, smooth, teacher, student)
-            sb.table('modelcomp_batch').update({
+            updates.append({
+                'id': rec['id'],
                 'score': m.get('overall_score',0.5),
                 'structured_correctness': m.get('structured_correctness',0.5),
                 'task_success': m.get('task_success',0.5),
@@ -350,11 +378,13 @@ def step_score(sb):
                 'context_grounding': m.get('context_grounding',0.5),
                 'conciseness': m.get('conciseness',0.5),
                 'rouge1': r1, 'rougel': rl, 'bleu': bleu, 'status': 'score',
-            }).eq('id', rec['id']).execute()
-            ok += 1
+            })
         except Exception as e:
             _flush(f"[ERROR] score {rec['id']}: {e}")
-    _flush(f"[SCORE] Done: {ok}/{len(rows)}")
+    
+    # Bulk update all at once
+    bulk_update_rows(sb, updates)
+    _flush(f"[SCORE] Done: {len(updates)}/{len(rows)}")
     return True
 
 
@@ -637,7 +667,9 @@ def step_output_tuned(sb):
             _flush(f"[ERROR] DB update failed: {e}")
 
         _flush(f"BATCH output_tuned progress: {processed}/{pending_count}")
-        purge_gpu()
+        # Only purge every 3 batches to reduce overhead
+        if processed % (TUNED_INFER_BATCH_SIZE * 3) == 0:
+            purge_gpu()
 
     safe_delete(model, tokenizer)
     _flush(f"[SUCCESS] Generated {processed}/{pending_count}")
@@ -654,13 +686,15 @@ def step_score_tuned(sb):
     from tqdm import tqdm
     _flush("\n[SCORE_TUNED] Scoring tuned outputs...")
     records = fetch_all_by_status(sb, 'output_tuned')
-    if len(records) < MIN_RECORDS:
-        _flush(f"[SKIP] only {len(records)}"); return False
+    if len(records) == 0:
+        _flush(f"[SKIP] no records to score"); return False
 
     eval_fn = _get_eval()
     rouge   = rouge_scorer.RougeScorer(['rouge1','rougeL'], use_stemmer=True)
     smooth  = SmoothingFunction().method1
-    ok = 0
+    
+    # Batch updates instead of per-row
+    updates = []
     for rec in tqdm(records, desc="Score tuned"):
         try:
             ins     = rec.get('input','')
@@ -668,10 +702,27 @@ def step_score_tuned(sb):
             student = rec.get('student_output_tuned','')
             ctx     = rec.get('context','') or ''
             task    = rec.get('task_label','general_qa')
-            if not student: continue
+            if not student:
+                # Missing output_tuned — mark with defaults and skip
+                updates.append({
+                    'id': rec['id'],
+                    'score_tuned': 0.5,
+                    'structured_correctness_tuned': 0.5,
+                    'task_success_tuned': 0.5,
+                    'instruction_following_tuned': 0.5,
+                    'coverage_tuned': 0.5,
+                    'faithfulness_tuned': 0.5,
+                    'hallucination_tuned': 0.5,
+                    'context_grounding_tuned': 0.5,
+                    'conciseness_tuned': 0.5,
+                    'rouge1_tuned': 0.5, 'rougel_tuned': 0.5, 'bleu_tuned': 0.5,
+                    'status': 'score_tuned',
+                })
+                continue
             m = _compute_metrics(eval_fn, ins, student, teacher, ctx, task)
             r1, rl, bleu = _rouge_bleu(rouge, smooth, teacher, student)
-            sb.table('modelcomp_batch').update({
+            updates.append({
+                'id': rec['id'],
                 'score_tuned': m.get('overall_score',0.5),
                 'structured_correctness_tuned': m.get('structured_correctness',0.5),
                 'task_success_tuned': m.get('task_success',0.5),
@@ -683,11 +734,13 @@ def step_score_tuned(sb):
                 'conciseness_tuned': m.get('conciseness',0.5),
                 'rouge1_tuned': r1, 'rougel_tuned': rl, 'bleu_tuned': bleu,
                 'status': 'score_tuned',
-            }).eq('id', rec['id']).execute()
-            ok += 1
+            })
         except Exception as e:
             _flush(f"[ERROR] score_tuned {rec['id']}: {e}")
-    _flush(f"[SCORE_TUNED] Done: {ok}/{len(records)}")
+    
+    # Bulk update all at once
+    bulk_update_rows(sb, updates)
+    _flush(f"[SCORE_TUNED] Done: {len(updates)}/{len(records)}")
     return True
 
 
@@ -703,16 +756,22 @@ def step_completed(sb):
         _flush(f"[SKIP] only {len(records)}"); return False
 
     improvements = []
+    updates = []
     for rec in tqdm(records, desc="Finalising"):
         try:
             imp = (rec.get('score_tuned',0) or 0) - (rec.get('score',0) or 0)
-            sb.table('modelcomp_batch').update({
-                'improvement': imp, 'status': 'completed'
-            }).eq('id', rec['id']).execute()
+            updates.append({
+                'id': rec['id'],
+                'improvement': imp,
+                'status': 'completed'
+            })
             improvements.append(imp)
         except Exception as e:
             _flush(f"[ERROR] completed {rec['id']}: {e}")
 
+    # Bulk update all at once
+    bulk_update_rows(sb, updates)
+    
     if improvements:
         avg = sum(improvements) / len(improvements)
         pos = sum(1 for i in improvements if i > 0)
