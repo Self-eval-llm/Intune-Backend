@@ -13,10 +13,22 @@ TRIGGER MODE:
 MANUAL MODE (Legacy):
     Can still be run directly for testing: python app/eval_finetune.py
     This will execute the old polling behavior for backward compatibility.
+
+ASYNC POLLING BASELINE (Research measurement):
+    main_async_polling_baseline() implements a realistic production polling system
+    where data prefetching for checkpoint N+1 runs in a background thread while
+    checkpoint N is training.  This is used to produce a fair comparison against
+    the event-driven pipeline for Table 6 of the INTUNE paper.
+
+    The transition latency measured here is:
+        time_threshold_crossed  →  time_run_finetune_called
+    accounting for the fact that prepare_training_data() has already completed
+    in the background, so only the remaining poll-sleep time contributes.
 """
 import os
 import sys
 import time
+import threading
 import subprocess
 import logging
 
@@ -427,6 +439,257 @@ def main():
             time.sleep(60)
 
     logger.info("Worker finished")
+
+
+# =============================================================================
+# ASYNC POLLING BASELINE — Research measurement for INTUNE paper Table 6
+# =============================================================================
+#
+# Design rationale
+# ----------------
+# The naive polling baseline (main() above) is unfair to compare against the
+# event-driven system because it assumes the system does nothing while training
+# is running.  A real production system would overlap work: while checkpoint N
+# trains, a background thread watches the DB and prefetches data for checkpoint
+# N+1.  When the next poll fires and the threshold is met, data is already on
+# disk — the only remaining latency is the tail of the current poll sleep.
+#
+# What we measure
+# ---------------
+# Transition latency = time from when check_finetune_conditions() first returns
+# True  →  time when run_finetune() (or its mock) is actually called.
+#
+# In the async baseline this is:
+#   - If prefetch already finished: ~0 s  (data ready, training starts immediately)
+#   - If prefetch still running:    time to wait for prefetch thread to join
+#   - Worst case (no prefetch yet): full prepare_training_data() duration
+#
+# The poll interval (300 s) determines *when* the condition is first noticed,
+# but that is separate from the transition latency once it is noticed.  The
+# measurement script (measure_latency.py) controls exactly when the threshold
+# is crossed relative to the poll cycle so we can isolate the prefetch benefit.
+#
+# run_finetune() is replaced by mock_run_finetune() (time.sleep(120)) so the
+# measurement runs in ~2 minutes instead of hours.
+# =============================================================================
+
+POLL_INTERVAL_SECONDS = 300  # unchanged — do not modify
+
+
+class _PrefetchState:
+    """
+    Shared state between the main polling loop and the background prefetch thread.
+
+    Attributes
+    ----------
+    thread : threading.Thread | None
+        The currently running prefetch thread, or None if no prefetch is active.
+    ready : bool
+        True once prepare_training_data() has completed successfully in the
+        background and the JSONL files are on disk.
+    lock : threading.Lock
+        Protects reads/writes to `ready` and `thread`.
+    """
+
+    def __init__(self):
+        self.thread: threading.Thread | None = None
+        self.ready: bool = False
+        self.lock: threading.Lock = threading.Lock()
+
+    def reset(self):
+        """Reset state for the next checkpoint cycle."""
+        with self.lock:
+            self.thread = None
+            self.ready = False
+
+
+def _prefetch_worker(state: _PrefetchState) -> None:
+    """
+    Background thread target: calls prepare_training_data() and sets state.ready.
+
+    This runs while the current checkpoint is training so that data for the
+    next checkpoint is already on disk when the poll condition fires.
+    """
+    logger.info("[ASYNC-POLL] Background prefetch started")
+    try:
+        success = prepare_training_data()
+        with state.lock:
+            state.ready = success
+        if success:
+            logger.info("[ASYNC-POLL] Background prefetch complete — data ready on disk")
+        else:
+            logger.warning("[ASYNC-POLL] Background prefetch returned False — data may be incomplete")
+    except Exception as exc:
+        logger.error(f"[ASYNC-POLL] Background prefetch raised: {exc}")
+        with state.lock:
+            state.ready = False
+
+
+def mock_run_finetune() -> bool:
+    """
+    Mock fine-tuning for latency measurement only.
+
+    Sleeps for 120 seconds to simulate a 2-minute training step without
+    consuming GPU memory or touching model weights.  Replace with run_finetune()
+    for production use.
+    """
+    logger.info("[ASYNC-POLL] mock_run_finetune: simulating 2-minute training step")
+    time.sleep(120)
+    logger.info("[ASYNC-POLL] mock_run_finetune: done")
+    return True
+
+
+def main_async_polling_baseline(
+    num_transitions: int = 3,
+    use_mock_finetune: bool = True,
+) -> list[float]:
+    """
+    Async polling baseline for INTUNE paper Table 6.
+
+    Runs `num_transitions` checkpoint transitions and returns a list of
+    transition latencies (seconds).  Each latency is the time from when
+    check_finetune_conditions() first returns True to when training starts,
+    accounting for background prefetching.
+
+    Parameters
+    ----------
+    num_transitions : int
+        Number of checkpoint transitions to measure (paper uses 3).
+    use_mock_finetune : bool
+        If True, replace run_finetune() with mock_run_finetune() (120 s sleep).
+        Set to False only when running a real training experiment.
+
+    Returns
+    -------
+    list[float]
+        Transition latency in seconds for each measured transition.
+    """
+    logger.info("=" * 60)
+    logger.info("ASYNC POLLING BASELINE — INTUNE Table 6 measurement")
+    logger.info(f"  Poll interval : {POLL_INTERVAL_SECONDS} s")
+    logger.info(f"  Transitions   : {num_transitions}")
+    logger.info(f"  Mock finetune : {use_mock_finetune}")
+    logger.info("=" * 60)
+
+    finetune_fn = mock_run_finetune if use_mock_finetune else run_finetune
+    transition_latencies: list[float] = []
+    state = _PrefetchState()
+
+    for transition_idx in range(1, num_transitions + 1):
+        logger.info(f"\n--- Transition {transition_idx}/{num_transitions} ---")
+        state.reset()
+
+        # ------------------------------------------------------------------ #
+        # PHASE 1: Poll until threshold is met                                #
+        # ------------------------------------------------------------------ #
+        threshold_crossed_at: float | None = None
+
+        while threshold_crossed_at is None:
+            logger.info(f"[ASYNC-POLL] Polling DB (interval={POLL_INTERVAL_SECONDS}s)...")
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+            if check_finetune_conditions():
+                threshold_crossed_at = time.time()
+                logger.info(
+                    f"[ASYNC-POLL] Threshold met at t={threshold_crossed_at:.3f}"
+                )
+            else:
+                logger.info("[ASYNC-POLL] Threshold not yet met, sleeping again")
+
+                # While waiting, kick off a speculative prefetch if one is not
+                # already running.  This mirrors what a real production system
+                # would do: start preparing data as soon as there is *any*
+                # activity, even before the threshold is confirmed.
+                with state.lock:
+                    prefetch_running = state.thread is not None and state.thread.is_alive()
+
+                if not prefetch_running:
+                    logger.info("[ASYNC-POLL] Launching speculative prefetch thread")
+                    t = threading.Thread(
+                        target=_prefetch_worker,
+                        args=(state,),
+                        daemon=True,
+                        name=f"prefetch-transition-{transition_idx}",
+                    )
+                    with state.lock:
+                        state.thread = t
+                    t.start()
+
+        # ------------------------------------------------------------------ #
+        # PHASE 2: Threshold crossed — wait for prefetch if still running,   #
+        #          then start training.  Measure the gap.                     #
+        # ------------------------------------------------------------------ #
+
+        # Check whether prefetch data is already ready
+        with state.lock:
+            data_ready = state.ready
+            prefetch_thread = state.thread
+
+        if data_ready:
+            logger.info("[ASYNC-POLL] Data already prefetched — starting training immediately")
+        elif prefetch_thread is not None and prefetch_thread.is_alive():
+            logger.info("[ASYNC-POLL] Prefetch still running — waiting for it to finish")
+            prefetch_thread.join()
+            with state.lock:
+                data_ready = state.ready
+            if data_ready:
+                logger.info("[ASYNC-POLL] Prefetch finished — data ready")
+            else:
+                logger.warning("[ASYNC-POLL] Prefetch finished but data not ready — running prepare now")
+                prepare_training_data()
+        else:
+            # No prefetch was started (threshold crossed on the very first poll
+            # before any speculative prefetch could be launched).
+            logger.info("[ASYNC-POLL] No prefetch available — running prepare_training_data() now")
+            prepare_training_data()
+
+        # Record the moment training is about to start
+        training_start_at = time.time()
+        transition_latency = training_start_at - threshold_crossed_at
+
+        print(
+            f"\n[METRIC ASYNC-POLL] TRANSITION LATENCY: {transition_latency:.3f}s"
+            f"  (transition {transition_idx}/{num_transitions})"
+        )
+        logger.info(
+            f"[ASYNC-POLL] Transition latency = {transition_latency:.3f}s"
+        )
+
+        transition_latencies.append(transition_latency)
+
+        # ------------------------------------------------------------------ #
+        # PHASE 3: Run (mock) fine-tuning                                     #
+        # ------------------------------------------------------------------ #
+        logger.info(f"[ASYNC-POLL] Starting finetune for transition {transition_idx}")
+        finetune_fn()
+
+        # While this checkpoint trains, launch the prefetch for the next one
+        # so it is ready when the next poll cycle fires.
+        if transition_idx < num_transitions:
+            logger.info("[ASYNC-POLL] Launching prefetch for next checkpoint while training")
+            state.reset()
+            t = threading.Thread(
+                target=_prefetch_worker,
+                args=(state,),
+                daemon=True,
+                name=f"prefetch-transition-{transition_idx + 1}",
+            )
+            with state.lock:
+                state.thread = t
+            t.start()
+
+        logger.info(f"[ASYNC-POLL] Transition {transition_idx} complete")
+
+    # Summary
+    mean_latency = sum(transition_latencies) / len(transition_latencies)
+    logger.info("=" * 60)
+    logger.info("ASYNC POLLING BASELINE — RESULTS")
+    for i, lat in enumerate(transition_latencies, 1):
+        logger.info(f"  Transition {i}: {lat:.3f}s")
+    logger.info(f"  Mean latency : {mean_latency:.3f}s")
+    logger.info("=" * 60)
+
+    return transition_latencies
 
 
 if __name__ == "__main__":
